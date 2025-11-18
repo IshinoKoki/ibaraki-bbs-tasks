@@ -166,11 +166,40 @@ if ($action === 'get') {
     $stL->execute([':id' => $task_id]);
     $logs = $stL->fetchAll(PDO::FETCH_ASSOC);
 
+    // 担当者一覧
+    $assignees = [];
+    $stA = $pdo->prepare('
+        SELECT ta.user_id, u.display_name
+          FROM task_assignees ta
+     LEFT JOIN users u ON ta.user_id = u.id
+         WHERE ta.task_id = :id
+         ORDER BY ta.is_primary DESC, u.display_name ASC, ta.user_id ASC
+    ');
+    $stA->execute([':id' => $task_id]);
+    while ($row = $stA->fetch(PDO::FETCH_ASSOC)) {
+        $assignees[] = [
+            'id'   => (int)$row['user_id'],
+            'name' => $row['display_name'] ?? '（不明）',
+        ];
+    }
+    if (!$assignees && !empty($task['assignee_id'])) {
+        $assignees[] = [
+            'id'   => (int)$task['assignee_id'],
+            'name' => $task['assignee_name'] ?? '（不明）',
+        ];
+    } elseif (!$assignees && !empty($task['assignee_name'])) {
+        $assignees[] = [
+            'id'   => 0,
+            'name' => $task['assignee_name'],
+        ];
+    }
+
     // タスク情報を整形して返す
     $task_payload = [
         'id'            => (int)$task['id'],
         'title'         => $task['title'],
         'assignee_name' => $task['assignee_name'] ?? null,
+        'assignees'     => $assignees,
         'status_name'   => $task['status_name']   ?? null,
         'priority_name' => $task['priority_name'] ?? null,
         'type_name'     => $task['type_name']     ?? null,

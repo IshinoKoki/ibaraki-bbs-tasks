@@ -14,6 +14,51 @@ $team_id = null;
 
 function h($s){ return htmlspecialchars((string)$s, ENT_QUOTES, 'UTF-8'); }
 
+function normalize_ids($input): array {
+  if (!is_array($input)) return [];
+  $ids = [];
+  foreach ($input as $v) {
+    $v = (int)$v;
+    if ($v > 0 && !in_array($v, $ids, true)) $ids[] = $v;
+  }
+  return $ids;
+}
+
+function fetch_user_names(PDO $pdo, array $ids): array {
+  if (!$ids) return [];
+  $in  = implode(',', array_fill(0, count($ids), '?'));
+  $st  = $pdo->prepare("SELECT id, display_name FROM users WHERE id IN ($in)");
+  $st->execute($ids);
+  $map = [];
+  while ($r = $st->fetch(PDO::FETCH_ASSOC)) {
+    $map[(int)$r['id']] = (string)($r['display_name'] ?? '');
+  }
+  return $map;
+}
+
+function sync_task_assignees(PDO $pdo, int $task_id, array $user_ids): void {
+  $pdo->prepare('DELETE FROM task_assignees WHERE task_id = :tid')->execute([':tid' => $task_id]);
+  if (!$user_ids) return;
+  $st = $pdo->prepare('INSERT INTO task_assignees (task_id, user_id, is_primary) VALUES (:tid, :uid, :primary)');
+  foreach ($user_ids as $idx => $uid) {
+    $st->execute([
+      ':tid'     => $task_id,
+      ':uid'     => $uid,
+      ':primary' => $idx === 0 ? 1 : 0,
+    ]);
+  }
+}
+
+function get_task_assignee_labels(PDO $pdo, int $task_id): array {
+  $st = $pdo->prepare('SELECT ta.user_id, u.display_name FROM task_assignees ta LEFT JOIN users u ON ta.user_id = u.id WHERE ta.task_id = :tid ORDER BY ta.is_primary DESC, u.display_name ASC, ta.user_id ASC');
+  $st->execute([':tid' => $task_id]);
+  $labels = [];
+  while ($r = $st->fetch(PDO::FETCH_ASSOC)) {
+    $labels[] = $r['display_name'] ?? '（不明）';
+  }
+  return $labels;
+}
+
 // 変更履歴用の共通関数
 function add_task_log(PDO $pdo, int $task_id, int $user_id, string $action, ?string $field, ?string $old, ?string $new){
   $st = $pdo->prepare("
@@ -46,6 +91,10 @@ if (empty($teamsList)) {
   $priorities = $pdo->query('SELECT id, name, color FROM task_priorities ORDER BY sort_order, id')->fetchAll();
   $types      = $pdo->query('SELECT id, name, color FROM task_types      ORDER BY sort_order, id')->fetchAll();
   $usersList  = $pdo->query('SELECT id, display_name FROM users ORDER BY display_name, id')->fetchAll();
+  $userNameMap = [];
+  foreach ($usersList as $u) {
+    $userNameMap[(int)$u['id']] = $u['display_name'];
+  }
 
   $viewsSt = $pdo->prepare('SELECT id, name, is_default FROM user_saved_views WHERE user_id=:uid AND (team_id=:tid OR team_id IS NULL) ORDER BY is_default DESC, name ASC');
   $viewsSt->execute([':uid'=>$uid, ':tid'=>$team_id]);
@@ -71,38 +120,7 @@ if (empty($teamsList)) {
           $params['assignee_ids'] = array_values(array_unique(array_map('intval', $_POST['param_assignee_ids'])));
         }
         if (!empty($_POST['param_status_ids']) && is_array($_POST['param_status_ids'])) {
-          $params['status_ids'] = array_values(array_unique(array_map('intval', $_POST['param_status_ids'])));
-        }
-        if (!empty($_POST['param_priority_ids']) && is_array($_POST['param_priority_ids'])) {
-          $params['priority_ids'] = array_values(array_unique(array_map('intval', $_POST['param_priority_ids'])));
-        }
-        if (!empty($_POST['param_type_ids']) && is_array($_POST['param_type_ids'])) {
-          $params['type_ids'] = array_values(array_unique(array_map('intval', $_POST['param_type_ids'])));
-        }
-
-        $now = date('Y-m-d H:i:s');
-        $st  = $pdo->prepare('INSERT INTO user_saved_views(user_id, team_id, name, params, is_default, created_at)
-                              VALUES(:uid,:tid,:name,:params,0,:at)
-                              ON DUPLICATE KEY UPDATE params=VALUES(params), created_at=VALUES(created_at)');
-        $st->execute([
-          ':uid'=>$uid, ':tid'=>$team_id, ':name'=>$view_name,
-          ':params'=>json_encode($params, JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES),
-          ':at'=>$now
-        ]);
-        $message = 'ビューを保存しました。';
-      }
-
-    } elseif ($action === 'apply_view' && !empty($_POST['view_id'])) {
-      $vid = (int)$_POST['view_id'];
-      $st  = $pdo->prepare('SELECT params FROM user_saved_views WHERE id=:id AND user_id=:uid');
-      $st->execute([':id'=>$vid, ':uid'=>$uid]);
-      if ($r = $st->fetch()) {
-        $params = json_decode($r['params'] ?? '[]', true) ?: [];
-        $params['team_id'] = $team_id;
-        $qs = http_build_query($params);
-        header('Location: index.php?'.$qs); exit;
-      } else {
-        $error = '指定のビューが見つかりません。';
+@@ -106,129 +155,158 @@ if (empty($teamsList)) {
       }
 
     } elseif ($action === 'delete_view' && !empty($_POST['view_id'])) {
@@ -130,6 +148,14 @@ if (empty($teamsList)) {
     if ($action === 'add') {
       $title       = trim($_POST['title'] ?? '');
       $assignee_id = ($_POST['assignee_id'] ?? '') !== '' ? (int)$_POST['assignee_id'] : null;
+      $title          = trim($_POST['title'] ?? '');
+      $rawAssigneeIds = normalize_ids($_POST['assignee_ids'] ?? []);
+      $assigneeNames  = fetch_user_names($pdo, $rawAssigneeIds);
+      $assignee_ids   = [];
+      foreach ($rawAssigneeIds as $aid) {
+        if (isset($assigneeNames[$aid])) $assignee_ids[] = $aid;
+      }
+      $primary_assignee_id = $assignee_ids[0] ?? null;
       $status_id   = ($_POST['status_id']   ?? '') !== '' ? (int)$_POST['status_id']   : null; // ← 未設定許可
       $due         = $_POST['due_date'] ?? '';
       $priority_id = isset($_POST['priority_id']) && $_POST['priority_id']!=='' ? (int)$_POST['priority_id'] : null;
@@ -145,6 +171,9 @@ if (empty($teamsList)) {
           $st->execute([':id'=>$assignee_id]);
           if ($r = $st->fetch()) $assignee_name = $r['display_name']; else $assignee_id = $assignee_name = null;
         }
+        $assignee_name = ($primary_assignee_id !== null && isset($assigneeNames[$primary_assignee_id]))
+          ? $assigneeNames[$primary_assignee_id]
+          : null;
         $pdo->prepare(
           'INSERT INTO tasks
             (team_id, title, status_id, assignee_id, assignee_name,
@@ -157,6 +186,7 @@ if (empty($teamsList)) {
         )->execute([
           ':team_id'=>$team_id, ':title'=>$title, ':status_id'=>$status_id,
           ':assignee_id'=>$assignee_id, ':assignee_name'=>$assignee_name,
+          ':assignee_id'=>$primary_assignee_id, ':assignee_name'=>$assignee_name,
           ':due_date'=>$due!=='' ? $due : null,
           ':priority_id'=>$priority_id, ':type_id'=>$type_id,
           ':updated_at'=>$now, ':created_at'=>$now, ':updated_by'=>$uid
@@ -164,6 +194,7 @@ if (empty($teamsList)) {
 
         // 作成ログ
         $newId = (int)$pdo->lastInsertId();
+        sync_task_assignees($pdo, $newId, $assignee_ids);
         add_task_log($pdo, $newId, $uid, 'create', null, null, 'タスクを作成');
 
         $message = 'タスクを追加しました。';
@@ -175,6 +206,7 @@ if (empty($teamsList)) {
       $field   = $_POST['field'];
       $value   = $_POST['value'] ?? '';
       $allowed = ['title','assignee_name','assignee_id','status_id','priority_id','type_id','due_date','description','url'];
+      $allowed = ['title','assignee_name','assignee_id','assignees','status_id','priority_id','type_id','due_date','description','url'];
 
       $resp = ['ok'=>false,'msg'=>'','field'=>$field];
 
@@ -197,7 +229,34 @@ if (empty($teamsList)) {
               $st = $pdo->prepare('SELECT display_name FROM users WHERE id=:id');
               $st->execute([':id'=>$assignee_id]);
               if ($r=$st->fetch()) $assignee_name = $r['display_name']; else $assignee_id = $assignee_name = null;
+          if ($field === 'assignee_id' || $field === 'assignees') {
+            if ($field === 'assignee_id') {
+              $selectedIds = $value!=='' ? [(int)$value] : [];
+            } else {
+              $selectedIds = [];
+              if ($value !== '') {
+                $decoded = json_decode($value, true);
+                if (is_array($decoded)) {
+                  foreach ($decoded as $vv) {
+                    $vv = (int)$vv;
+                    if ($vv > 0) $selectedIds[] = $vv;
+                  }
+                }
+              }
             }
+            $selectedIds = normalize_ids($selectedIds);
+            $assigneeNames = fetch_user_names($pdo, $selectedIds);
+            $finalIds = [];
+            foreach ($selectedIds as $sid) {
+              if (isset($assigneeNames[$sid])) $finalIds[] = $sid;
+            }
+            $primaryId   = $finalIds[0] ?? null;
+            $primaryName = ($primaryId !== null && isset($assigneeNames[$primaryId])) ? $assigneeNames[$primaryId] : null;
+            $beforeList  = get_task_assignee_labels($pdo, $task_id);
+            if (!$beforeList && !empty($before['assignee_name'])) {
+              $beforeList = [$before['assignee_name']];
+            }
+
             $pdo->prepare('UPDATE tasks SET assignee_id=:aid, assignee_name=:an, updated_at=:u, updated_by=:ub WHERE id=:id')
                 ->execute([':aid'=>$assignee_id, ':an'=>$assignee_name, ':u'=>$now, ':ub'=>$uid, ':id'=>$task_id]);
             $resp = ['ok'=>true,'msg'=>'担当者を更新しました。','assignee_name'=>$assignee_name];
@@ -207,6 +266,19 @@ if (empty($teamsList)) {
             $new = $assignee_name ?: '未設定';
             if ($old !== $new) {
               add_task_log($pdo, $task_id, $uid, 'update', 'assignee', $old, $new);
+                ->execute([':aid'=>$primaryId, ':an'=>$primaryName, ':u'=>$now, ':ub'=>$uid, ':id'=>$task_id]);
+            sync_task_assignees($pdo, $task_id, $finalIds);
+
+            $resp = ['ok'=>true,'msg'=>'担当者を更新しました。'];
+
+            $newList = [];
+            foreach ($finalIds as $fid) {
+              $newList[] = $assigneeNames[$fid] ?? '（不明）';
+            }
+            $oldText = $beforeList ? implode(', ', $beforeList) : '未設定';
+            $newText = $newList ? implode(', ', $newList) : '未設定';
+            if ($oldText !== $newText) {
+              add_task_log($pdo, $task_id, $uid, 'update', 'assignee', $oldText, $newText);
             }
 
           } else {
@@ -232,100 +304,7 @@ if (empty($teamsList)) {
                 break;
 
               case 'status_id':
-                $oldText = '(未設定)'; $newText = '(未設定)';
-                if (!empty($before['status_id'])) {
-                  $st = $pdo->prepare('SELECT name FROM task_statuses WHERE id=:id');
-                  $st->execute([':id'=>$before['status_id']]);
-                  $oldText = $st->fetchColumn() ?: '(未設定)';
-                }
-                if (!empty($val)) {
-                  $st = $pdo->prepare('SELECT name FROM task_statuses WHERE id=:id');
-                  $st->execute([':id'=>$val]);
-                  $newText = $st->fetchColumn() ?: '(未設定)';
-                }
-                break;
-
-              case 'priority_id':
-                $oldText = '(未設定)'; $newText = '(未設定)';
-                if (!empty($before['priority_id'])) {
-                  $st = $pdo->prepare('SELECT name FROM task_priorities WHERE id=:id');
-                  $st->execute([':id'=>$before['priority_id']]);
-                  $oldText = $st->fetchColumn() ?: '(未設定)';
-                }
-                if (!empty($val)) {
-                  $st = $pdo->prepare('SELECT name FROM task_priorities WHERE id=:id');
-                  $st->execute([':id'=>$val]);
-                  $newText = $st->fetchColumn() ?: '(未設定)';
-                }
-                break;
-
-              case 'type_id':
-                $oldText = '(未設定)'; $newText = '(未設定)';
-                if (!empty($before['type_id'])) {
-                  $st = $pdo->prepare('SELECT name FROM task_types WHERE id=:id');
-                  $st->execute([':id'=>$before['type_id']]);
-                  $oldText = $st->fetchColumn() ?: '(未設定)';
-                }
-                if (!empty($val)) {
-                  $st = $pdo->prepare('SELECT name FROM task_types WHERE id=:id');
-                  $st->execute([':id'=>$val]);
-                  $newText = $st->fetchColumn() ?: '(未設定)';
-                }
-                break;
-
-              case 'due_date':
-                $oldText = $before['due_date'] ?: '(未設定)';
-                $newText = $val ?: '(未設定)';
-                break;
-
-              case 'description':
-                $oldText = ($before['description'] ?? '') === '' ? '(空)' : $before['description'];
-                $newText = ($val ?? '') === '' ? '(空)' : $val;
-                break;
-
-              case 'url':
-                $oldText = ($before['url'] ?? '') === '' ? '(未設定)' : $before['url'];
-                $newText = ($val ?? '') === '' ? '(未設定)' : $val;
-                break;
-
-              default:
-                $oldText = (string)($before[$field] ?? '');
-                $newText = (string)($val ?? '');
-            }
-
-            if ($oldText !== $newText) {
-              add_task_log($pdo, $task_id, $uid, 'update', $field, $oldText, $newText);
-            }
-          }
-        }
-      } else {
-        $resp = ['ok'=>false,'msg'=>'この項目は編集できません。'];
-      }
-
-      if ($isAjax) {
-        header('Content-Type: application/json; charset=utf-8');
-        echo json_encode($resp, JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES);
-        exit;
-      }
-
-    } elseif ($action === 'delete' && isset($_POST['task_id'])) {
-      $task_id = (int)$_POST['task_id'];
-      $now = date('Y-m-d H:i:s');
-
-      // 削除前タイトル取得
-      $stOld = $pdo->prepare('SELECT title FROM tasks WHERE id=:id');
-      $stOld->execute([':id'=>$task_id]);
-      $oldTitle = $stOld->fetchColumn() ?: null;
-
-      $pdo->prepare('UPDATE tasks SET deleted_at=:d, updated_at=:u, updated_by=:ub WHERE id=:id')
-          ->execute([':d'=>$now, ':u'=>$now, ':ub'=>$uid, ':id'=>$task_id]);
-
-      add_task_log($pdo, $task_id, $uid, 'delete', null, $oldTitle, 'タスクを削除');
-
-      $message='タスクを削除しました。';
-    }
-  }
-
+@@ -329,90 +407,136 @@ if (empty($teamsList)) {
   /* =========================
      フィルタ
      ========================= */
@@ -352,6 +331,20 @@ if (empty($teamsList)) {
     $where[] = "$col IN (".implode(',', $names).")";
   };
   $mkIn($f_assignees,  'assignee_', 't.assignee_id');
+  if ($f_assignees) {
+    $names = [];
+    foreach ($f_assignees as $i => $v) {
+      $n = ":assignee_$i";
+      $names[] = $n;
+      $binds[$n] = (int)$v;
+    }
+    $where[] = "EXISTS (
+      SELECT 1
+        FROM task_assignees ta
+       WHERE ta.task_id = t.id
+         AND ta.user_id IN (".implode(',', $names).")
+    )";
+  }
   $mkIn($f_statuses,   'status_',   't.status_id');
   $mkIn($f_priorities, 'priority_', 't.priority_id');
   $mkIn($f_types,      'type_',     't.type_id');
@@ -391,6 +384,39 @@ if (empty($teamsList)) {
   $st = $pdo->prepare($sql);
   $st->execute($binds);
   $tasks = $st->fetchAll();
+  $taskAssigneesMap = [];
+  if ($tasks) {
+    $ids = array_map(fn($r)=>(int)$r['id'], $tasks);
+    $in  = implode(',', array_fill(0, count($ids), '?'));
+    if ($in !== '') {
+      $stA = $pdo->prepare("SELECT ta.task_id, ta.user_id, ta.is_primary, u.display_name FROM task_assignees ta LEFT JOIN users u ON ta.user_id = u.id WHERE ta.task_id IN ($in) ORDER BY ta.is_primary DESC, u.display_name ASC, ta.user_id ASC");
+      $stA->execute($ids);
+      while ($row = $stA->fetch(PDO::FETCH_ASSOC)) {
+        $tid = (int)$row['task_id'];
+        if (!isset($taskAssigneesMap[$tid])) $taskAssigneesMap[$tid] = [];
+        $taskAssigneesMap[$tid][] = [
+          'id'   => (int)$row['user_id'],
+          'name' => $row['display_name'] ?? '（不明）',
+        ];
+      }
+    }
+    foreach ($tasks as $tRow) {
+      $tid = (int)$tRow['id'];
+      if (!isset($taskAssigneesMap[$tid]) || !$taskAssigneesMap[$tid]) {
+        if (!empty($tRow['assignee_id'])) {
+          $taskAssigneesMap[$tid] = [[
+            'id'   => (int)$tRow['assignee_id'],
+            'name' => $tRow['assignee_name'] ?? '（不明）',
+          ]];
+        } elseif (!empty($tRow['assignee_name'])) {
+          $taskAssigneesMap[$tid] = [[
+            'id'   => 0,
+            'name' => $tRow['assignee_name'],
+          ]];
+        }
+      }
+    }
+  }
 
   // 添付有無
   $filesMap = [];
@@ -416,49 +442,7 @@ if (empty($teamsList)) {
     --border:#e5e7eb; --shadow:0 10px 25px rgba(0,0,0,.06);
   }
   *{ box-sizing: border-box; }
-  body{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:0;background:var(--bg);color:#0f172a;}
-
-  /* ===== 固定ヘッダー ===== */
-  .topbar{position:sticky;top:0;z-index:50;background:#fff;border-bottom:1px solid var(--border);box-shadow:0 2px 8px rgba(0,0,0,.03);}
-  .topbar-inner{max-width:1200px;margin:0 auto;padding:10px 20px;}
-  .tb-row{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;}
-  .tb-title{font-weight:700;color:#111827;}
-  .tb-links{font-size:12px;color:#4b5563;}
-  .tb-links a{color:var(--blue);text-decoration:none;margin-left:6px;}
-  .tb-teams{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px;}
-  .tb-team{padding:6px 12px;border-radius:999px;border:1px solid var(--accent);font-size:12px;text-decoration:none;color:#9a3412;background:var(--accent-weak);}
-  .tb-team.active{background:var(--accent);color:#fff;border-color:var(--accent);font-weight:600;}
-
-  /* 追加：ページ切替タブ（タスク一覧 / マイタスク） */
-  .tb-pages{display:flex;gap:8px;flex-wrap:wrap;margin-top:6px;}
-  .tb-page{
-    padding:4px 12px;
-    border-radius:999px;
-    border:1px solid transparent;
-    font-size:12px;
-    text-decoration:none;
-    color:#374151;
-    background:#f3f4f6;
-  }
-  .tb-page.active{
-    background:var(--accent);
-    color:#fff;
-    border-color:var(--accent);
-    font-weight:600;
-  }
-
-  /* ===== メイン ===== */
-  .app{max-width:1200px;margin:16px auto 24px;padding:16px 20px 24px;background:var(--panel);border-radius:16px;box-shadow:var(--shadow);}
-
-  .pill-btn{display:inline-block;padding:8px 12px;border-radius:999px;border:none;cursor:pointer;font-size:12px;text-decoration:none;color:#fff;}
-  .pill-btn.orange{background:var(--accent);} .pill-btn.blue{background:var(--blue);}
-  .btn-ghost{padding:8px 12px;border-radius:999px;border:1px solid var(--border);background:#fff;color:#111;cursor:pointer;}
-  .btn-ghost:hover{background:#f9fafb;}
-
-  .toolbar-toggle{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;}
-  .toolbar{display:none;}
-
-  .card{background:#fff;border:1px solid var(--border);border-radius:12px;padding:12px;margin-top:12px;box-shadow:0 2px 10px rgba(0,0,0,.03);}
+@@ -462,50 +586,69 @@ if (empty($teamsList)) {
   .card h2{font-size:14px;margin:0 0 10px;color:#111827;display:flex;align-items:center;gap:8px;}
   .card .sub{font-size:12px;color:var(--muted);}
   .label{font-size:12px;color:#374151;}
@@ -483,6 +467,25 @@ if (empty($teamsList)) {
   .inline-input:hover{border-color:#e5e7eb;background:#f9fafb;}
   .inline-input:focus{outline:none;border-color:var(--accent);background:#fff7ed;}
   .inline-select{appearance:none;padding:6px 20px;border-radius:999px;font-size:12px;text-align-last:center;border:1px solid rgba(0,0,0,.1);cursor:pointer;background:#fff;color:#111;}
+
+  .assignee-picker{position:relative;border:1px solid var(--border);border-radius:10px;padding:6px 8px;min-height:38px;background:#fff;display:flex;flex-direction:column;gap:4px;cursor:pointer;}
+  .assignee-picker-inline{border:none;padding:0;background:transparent;cursor:pointer;}
+  .assignee-picker-display{display:flex;flex-wrap:wrap;gap:6px;align-items:center;min-height:24px;}
+  .assignee-picker .placeholder{color:#9ca3af;font-size:12px;}
+  .assignee-picker-inline .assignee-picker-display{min-height:auto;}
+  .assignee-picker-fallback{font-size:12px;color:#374151;}
+  .assignee-picker-hidden{display:none;}
+  .assignee-pill{background:#f3f4f6;border-radius:999px;padding:2px 8px;font-size:12px;display:inline-flex;align-items:center;gap:4px;}
+  .assignee-pill button{border:none;background:none;color:#9ca3af;cursor:pointer;padding:0;font-size:12px;}
+  .assignee-picker-inline .assignee-pill{background:#fee2e2;}
+  .assignee-picker-dropdown{position:absolute;left:0;top:100%;margin-top:4px;background:#fff;border:1px solid var(--border);border-radius:12px;box-shadow:0 14px 30px rgba(15,23,42,.18);width:240px;z-index:80;display:none;flex-direction:column;}
+  .assignee-picker-inline .assignee-picker-dropdown{min-width:260px;}
+  .assignee-picker-dropdown.show{display:flex;}
+  .assignee-picker-search{border:none;border-bottom:1px solid var(--border);padding:8px 10px;font-size:13px;outline:none;}
+  .assignee-picker-options{max-height:220px;overflow:auto;}
+  .assignee-option{display:flex;justify-content:space-between;align-items:center;width:100%;padding:8px 12px;border:none;background:none;font-size:13px;cursor:pointer;}
+  .assignee-option:hover{background:#fff7ed;}
+  .assignee-option.active{color:var(--accent);font-weight:600;}
 
   th.col-title   {min-width:260px;}
   th.col-due     {width:110px;}
@@ -509,167 +512,7 @@ if (empty($teamsList)) {
   .td-comment-item.mine:hover{
     background:#f9fafb;
   }
-  .td-comment-main{
-    font-size:13px;
-  }
-  .td-comment-meta{
-    font-size:11px;
-    color:#6b7280;
-    margin-bottom:2px;
-    display:flex;
-    gap:6px;
-  }
-  .td-comment-body{
-    font-size:13px;
-    line-height:1.4;
-  }
-
-  .td-comment-menu-wrap{
-    position:absolute;
-    top:4px;
-    right:4px;
-    opacity:0;
-    transition:opacity .15s ease;
-  }
-  .td-comment-item.mine:hover .td-comment-menu-wrap{
-    opacity:1;
-  }
-  .td-comment-menu-btn{
-    border:none;
-    background:transparent;
-    cursor:pointer;
-    font-size:16px;
-    line-height:1;
-    padding:2px 6px;
-    border-radius:999px;
-  }
-  .td-comment-menu-btn:hover{
-    background:#e5e7eb;
-  }
-
-  .td-comment-menu-popover{
-    position:absolute;
-    top:100%;
-    right:0;
-    margin-top:4px;
-    background:#ffffff;
-    border:1px solid #e5e7eb;
-    border-radius:8px;
-    box-shadow:0 8px 16px rgba(0,0,0,.15);
-    padding:4px 0;
-    display:none;
-    z-index:2000;
-  }
-  .td-comment-menu-wrap.open .td-comment-menu-popover{
-    display:block;
-  }
-  .td-comment-menu-popover button{
-    display:block;
-    width:100%;
-    padding:6px 14px;
-    border:none;
-    background:transparent;
-    font-size:12px;
-    text-align:left;
-    cursor:pointer;
-  }
-  .td-comment-menu-popover button:hover{
-    background:#f3f4f6;
-  }
-  .td-comment-delete{
-    color:#b91c1c;
-  }
-
-</style>
-</head>
-<body>
-
-<header class="topbar">
-  <div class="topbar-inner">
-    <div class="tb-row">
-      <div class="tb-title">茨木BBS会タスク管理</div>
-      <div class="tb-links">
-    <?php echo h($user['display_name'] ?? ''); ?> さん
-
-    <!-- 🔔 通知アイコンを追加 -->
-    ／ <a href="notifications.php" style="position:relative;text-decoration:none;color:#2563eb;">
-        🔔 通知
-        <span id="notif-badge"
-              style="background:red;color:white;border-radius:50%;padding:2px 6px;
-                     font-size:10px;position:absolute;top:-6px;right:-10px;display:none;">
-        </span>
-    </a>
-
-    ／ <a href="change_password.php">パスワード変更</a>
-    <?php if (!empty($user['role']) && $user['role']==='admin'): ?>
-      ／ <a href="admin_users.php">ユーザー管理</a>
-      ／ <a href="admin_masters.php">マスタ管理</a>
-    <?php endif; ?>
-    ／ <a href="logout.php">ログアウト</a>
-</div>
-    </div>
-
-    <!-- チーム切替 -->
-    <?php
-      // 現在のクエリパラメータをベースにして、team_id だけを後から差し替える
-      $baseParams = $_GET;
-      unset($baseParams['team_id']); // team_id は各タブごとに上書きする
-    ?>
-    <div class="tb-teams">
-      <?php foreach ($teamsList as $t): ?>
-        <?php
-          $tid      = (int)$t['id'];
-          $isActive = ($tid === (int)$team_id);
-
-          // ベースのパラメータに team_id だけ入れ替え
-          $params = $baseParams;
-          $params['team_id'] = $tid;
-          $qs = http_build_query($params);
-        ?>
-        <a class="tb-team<?php echo $isActive ? ' active' : ''; ?>"
-           href="index.php<?php echo $qs ? ('?' . $qs) : ''; ?>">
-          <?php echo h($t['name']); ?>
-        </a>
-      <?php endforeach; ?>
-    </div>
-
-
-    <!-- ページ切替（タスク一覧 / マイタスク） -->
-    <div class="tb-pages">
-      <?php $isMyTasks = !empty($_GET['my']); ?>
-      <a href="index.php?team_id=<?php echo (int)$team_id; ?>"
-         class="tb-page <?php echo $isMyTasks ? '' : 'active'; ?>">
-        タスク一覧
-      </a>
-      <a href="my_tasks.php?team_id=<?php echo (int)$team_id; ?>"
-         class="tb-page <?php echo $isMyTasks ? 'active' : ''; ?>">
-        マイタスク
-      </a>
-      <a href="calendar.php?team_id=<?php echo (int)$team_id; ?>"
-         class="tb-page">
-        タスクカレンダー
-      </a>
-    </div>
-
-  </div>
-</header>
-
-<div class="app">
-  <?php if ($message): ?><div class="msg ok" style="color:#059669;margin-bottom:6px;"><?php echo h($message); ?></div><?php endif; ?>
-  <?php if ($error):   ?><div class="msg err" style="color:#b91c1c;margin-bottom:6px;"><?php echo h($error);   ?></div><?php endif; ?>
-
-  <div class="toolbar-toggle">
-    <button class="pill-btn orange" type="button" onclick="toggleFilters()">絞り込み</button>
-    <div style="font-size:12px;color:#6b7280;">表示中：<?php echo (int)($taskCount ?? 0); ?> 件</div>
-  </div>
-
-  <div class="card toolbar" id="toolbarCard">
-    <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:6px;">
-      <h2>表示コントロール <span class="sub">（検索・絞り込み・保存ビュー）</span></h2>
-      <div style="display:flex;gap:6px;align-items:center;">
-        <form id="applyViewForm" method="post" style="display:inline-flex;gap:6px;align-items:center;">
-          <input type="hidden" name="action" value="apply_view">
-          <select name="view_id" id="viewSelect" class="select" style="min-width:220px;">
+@@ -673,57 +816,76 @@ if (empty($teamsList)) {
             <?php if (empty($savedViews)): ?>
               <option value="">保存ビューはありません</option>
             <?php else: foreach ($savedViews as $v): ?>
@@ -702,6 +545,32 @@ if (empty($teamsList)) {
               </option>
             <?php endforeach; ?>
           </select>
+          <?php
+            $assigneeFilterLabels = [];
+            foreach ($f_assignees as $aid) {
+              if (isset($userNameMap[$aid])) $assigneeFilterLabels[$aid] = $userNameMap[$aid];
+            }
+          ?>
+          <div class="assignee-picker"
+               data-assignee-picker
+               data-picker-id="filter-assignees"
+               data-name="assignee_ids[]"
+               data-placeholder="担当者を選択"
+               data-value='<?php echo h(json_encode($f_assignees, JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES)); ?>'
+               data-extra-labels='<?php echo h(json_encode($assigneeFilterLabels, JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES)); ?>'>
+            <div class="assignee-picker-hidden">
+              <?php foreach ($f_assignees as $aid): ?>
+                <input type="hidden" name="assignee_ids[]" value="<?php echo (int)$aid; ?>">
+              <?php endforeach; ?>
+            </div>
+            <div class="assignee-picker-fallback">
+              <?php if ($f_assignees): ?>
+                <?php echo h(implode(', ', array_map(fn($id)=>$userNameMap[$id] ?? '（不明）', $f_assignees))); ?>
+              <?php else: ?>
+                <span class="placeholder">担当者を選択</span>
+              <?php endif; ?>
+            </div>
+          </div>
         </div>
 
         <div class="field">
@@ -727,38 +596,7 @@ if (empty($teamsList)) {
         </div>
 
         <div class="field">
-          <label class="label">種別（複数可）</label>
-          <select class="select js-multi-click" name="type_ids[]" multiple>
-            <?php foreach ($types as $ty): $val=(int)$ty['id']; ?>
-              <option value="<?php echo $val; ?>" <?php if(in_array($val,$f_types,true)) echo 'selected'; ?>>
-                <?php echo h($ty['name']); ?>
-              </option>
-            <?php endforeach; ?>
-          </select>
-        </div>
-
-        <div class="field">
-          <label class="label">並び替え</label>
-          <select class="select" name="sort">
-            <option value="">デフォルト</option>
-            <option value="due_asc"       <?php if($sort==='due_asc') echo 'selected'; ?>>期日 早い順</option>
-            <option value="due_desc"      <?php if($sort==='due_desc') echo 'selected'; ?>>期日 遅い順</option>
-            <option value="updated_desc"  <?php if($sort==='updated_desc') echo 'selected'; ?>>更新 新しい順</option>
-            <option value="updated_asc"   <?php if($sort==='updated_asc') echo 'selected'; ?>>更新 古い順</option>
-            <option value="priority_desc" <?php if($sort==='priority_desc') echo 'selected'; ?>>優先度 高い順</option>
-            <option value="priority_asc"  <?php if($sort==='priority_asc') echo 'selected'; ?>>優先度 低い順</option>
-            <option value="title_asc"     <?php if($sort==='title_asc') echo 'selected'; ?>>タイトル A→Z</option>
-            <option value="title_desc"    <?php if($sort==='title_desc') echo 'selected'; ?>>タイトル Z→A</option>
-          </select>
-        </div>
-
-        <div class="field">
-          <label class="label">期日（開始）</label>
-          <input class="input" type="date" name="due_from" value="<?php echo h($f_due_from); ?>">
-        </div>
-        <div class="field">
-          <label class="label">期日（終了）</label>
-          <input class="input" type="date" name="due_to" value="<?php echo h($f_due_to); ?>">
+@@ -762,56 +924,59 @@ if (empty($teamsList)) {
         </div>
 
         <div class="filters-actions" style="grid-column: 1 / -1;">
@@ -790,6 +628,15 @@ if (empty($teamsList)) {
             <option value="<?php echo (int)$u['id']; ?>"><?php echo h($u['display_name']); ?></option>
           <?php endforeach; ?>
         </select>
+        <div class="assignee-picker"
+             data-assignee-picker
+             data-picker-id="add-assignees"
+             data-name="assignee_ids[]"
+             data-placeholder="担当者を追加"
+             data-value="[]">
+          <div class="assignee-picker-hidden"></div>
+          <div class="assignee-picker-fallback"><span class="placeholder">担当者を追加</span></div>
+        </div>
       </div>
       <div class="add-field">
         <label class="label">ステータス</label>
@@ -815,20 +662,7 @@ if (empty($teamsList)) {
           <option value="">未設定</option>
           <?php foreach ($types as $ty): ?>
             <option value="<?php echo (int)$ty['id']; ?>"><?php echo h($ty['name']); ?></option>
-          <?php endforeach; ?>
-        </select>
-      </div>
-      <div class="add-field">
-        <label class="label">期日</label>
-        <input class="input" name="due_date" type="date">
-      </div>
-      <div class="add-actions">
-        <button type="submit" class="pill-btn orange">追加</button>
-      </div>
-    </form>
-  </div>
-
-  <div class="table-wrap" id="tableWrap">
+@@ -832,67 +997,79 @@ if (empty($teamsList)) {
     <table id="taskTable">
       <thead>
       <tr>
@@ -871,6 +705,35 @@ if (empty($teamsList)) {
                 <option value="" selected data-color="#d9d9d9"><?php echo h($t['assignee_name'].'（未登録）'); ?></option>
               <?php endif; ?>
             </select>
+          <?php
+            $taskAssignees = $taskAssigneesMap[$tid] ?? [];
+            $taskAssigneeIds = [];
+            $taskAssigneeExtras = [];
+            $taskLegacyLabels = [];
+            foreach ($taskAssignees as $assRow) {
+              $aid = (int)($assRow['id'] ?? 0);
+              if ($aid > 0) {
+                $taskAssigneeIds[] = $aid;
+                $taskAssigneeExtras[$aid] = $assRow['name'] ?? '';
+              } else {
+                if (!empty($assRow['name'])) $taskLegacyLabels[] = $assRow['name'];
+              }
+            }
+            $assigneeFallback = $taskAssignees
+              ? implode(', ', array_map(fn($row)=>$row['name'] ?? '（不明）', $taskAssignees))
+              : '未設定';
+          ?>
+          <td class="fit">
+            <div class="assignee-picker assignee-picker-inline"
+                 data-assignee-picker
+                 data-mode="inline"
+                 data-task-id="<?php echo $tid; ?>"
+                 data-placeholder="担当者を追加"
+                 data-value='<?php echo h(json_encode($taskAssigneeIds, JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES)); ?>'
+                 data-extra-labels='<?php echo h(json_encode($taskAssigneeExtras, JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES)); ?>'
+                 data-legacy-labels='<?php echo h(json_encode($taskLegacyLabels, JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES)); ?>'>
+              <div class="assignee-picker-fallback"><?php echo h($assigneeFallback); ?></div>
+            </div>
           </td>
 
           <td class="fit center">
@@ -896,142 +759,7 @@ if (empty($teamsList)) {
           </td>
 
           <td class="fit center">
-            <select class="inline-select js-inline-input js-colored" data-id="<?php echo $tid; ?>" data-field="type_id">
-              <option value="" data-color="#d9d9d9" <?php echo $t['type_id']===null?'selected':''; ?>>未設定</option>
-              <?php foreach ($types as $ty): ?>
-                <option value="<?php echo (int)$ty['id']; ?>" data-color="<?php echo h($ty['color'] ?: '#6b7280'); ?>" <?php if((int)$ty['id']===(int)$t['type_id']) echo 'selected'; ?>>
-                  <?php echo h($ty['name']); ?>
-                </option>
-              <?php endforeach; ?>
-            </select>
-          </td>
-
-          <td><input type="date" class="inline-input js-inline-input" data-id="<?php echo $tid; ?>" data-field="due_date" value="<?php echo h($t['due_date'] ?? ''); ?>"></td>
-
-          <td><input type="text" class="inline-input js-desc-input" data-id="<?php echo $tid; ?>" data-field="description" value="<?php echo h($t['description'] ?? ''); ?>"></td>
-
-          <td class="url-cell">
-            <input type="text" class="inline-input js-url-input" data-id="<?php echo $tid; ?>" data-field="url" value="<?php echo h($t['url'] ?? ''); ?>">
-          </td>
-
-          <td>
-            <?php if (!empty($filesMap[$tid])): ?>
-              <a class="pill-btn blue" href="task_files.php?task_id=<?php echo $tid; ?>">確認</a>
-            <?php else: ?>
-              <a class="pill-btn orange" href="task_files.php?task_id=<?php echo $tid; ?>">添付</a>
-            <?php endif; ?>
-          </td>
-
-          <td><?php echo h($t['updated_at'] ?? ''); ?></td>
-
-          <td>
-            <button type="button"
-                    class="pill-btn blue js-detail-btn"
-                    data-id="<?php echo $tid; ?>"
-                    style="margin-right:4px;">
-              詳細
-            </button>
-
-            <form method="post" onsubmit="return confirm('このタスクを削除しますか？');" style="display:inline;">
-              <input type="hidden" name="action" value="delete">
-              <input type="hidden" name="task_id" value="<?php echo $tid; ?>">
-              <button type="submit" class="pill-btn orange">削除</button>
-            </form>
-          </td>
-        </tr>
-      <?php endforeach; endif; ?>
-      </tbody>
-    </table>
-  </div>
-</div>
-
-<!-- 隠しフォーム（ビュー操作用） -->
-<form id="defaultViewForm" method="post" style="display:none;">
-  <input type="hidden" name="action" value="set_default_view">
-  <input type="hidden" name="view_id" value="">
-</form>
-<form id="deleteViewForm" method="post" style="display:none;">
-  <input type="hidden" name="action" value="delete_view">
-  <input type="hidden" name="view_id" value="">
-</form>
-
-<!-- 説明モーダル -->
-<div id="descModal" style="position:fixed;inset:0;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center;z-index:1000;">
-  <div style="width:min(90vw,700px);background:#fff;border-radius:12px;padding:16px;box-shadow:0 20px 40px rgba(0,0,0,.2);">
-    <h3 style="margin:0 0 8px;font-size:16px;">説明（全文編集）</h3>
-    <textarea id="descTextarea" style="width:100%;min-height:200px;font-size:13px;padding:8px;border:1px solid #e5e7eb;border-radius:8px;box-sizing:border-box;"></textarea>
-    <div style="margin-top:12px;display:flex;gap:8px;justify-content:flex-end;">
-      <button type="button" id="descCancel" class="btn-ghost">キャンセル</button>
-      <button type="button" id="descSave"   class="pill-btn orange">保存</button>
-    </div>
-  </div>
-</div>
-
-<!-- タスク詳細モーダル -->
-<div id="taskDetailModal" style="position:fixed;inset:0;background:rgba(0,0,0,.35);display:none;align-items:center;justify-content:center;z-index:1100;">
-  <div style="width:min(95vw,900px);max-height:90vh;overflow:auto;background:#fff;border-radius:12px;padding:16px;box-shadow:0 20px 40px rgba(0,0,0,.2);">
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
-      <h3 style="margin:0;font-size:16px;">タスク詳細</h3>
-      <button type="button" id="taskDetailClose" class="btn-ghost">× 閉じる</button>
-    </div>
-
-    <!-- 基本情報 -->
-    <div style="display:grid;grid-template-columns:1.5fr 1fr;gap:10px;margin-bottom:12px;">
-      <div>
-        <div class="label">タスク名</div>
-        <div id="td-title" style="font-weight:600;"></div>
-      </div>
-      <div>
-        <div class="label">担当者</div>
-        <div id="td-assignee"></div>
-      </div>
-      <div>
-        <div class="label">ステータス</div>
-        <div id="td-status"></div>
-      </div>
-      <div>
-        <div class="label">優先度</div>
-        <div id="td-priority"></div>
-      </div>
-      <div>
-        <div class="label">種別</div>
-        <div id="td-type"></div>
-      </div>
-      <div>
-        <div class="label">期日</div>
-        <div id="td-due"></div>
-      </div>
-      <div style="grid-column:1/-1;">
-        <div class="label">URL</div>
-        <div id="td-url"></div>
-      </div>
-    </div>
-
-    <!-- 説明 -->
-    <div style="margin-bottom:16px;">
-      <div class="label">説明</div>
-      <div id="td-desc" style="white-space:pre-wrap;border:1px solid #e5e7eb;border-radius:8px;padding:8px;font-size:13px;background:#f9fafb;"></div>
-    </div>
-
-    <div style="display:grid;grid-template-columns:1.2fr 1fr;gap:12px;">
-      <!-- コメント -->
-      <div>
-        <h4 style="margin:0 0 4px;font-size:14px;">コメント</h4>
-        <div id="td-comments"
-             style="max-height:220px;overflow:auto;border:1px solid #e5e7eb;border-radius:8px;
-                    padding:6px 8px;margin-bottom:6px;font-size:13px;"></div>
-
-        <div style="position:relative;">
-          <textarea id="td-comment-input"
-                    placeholder="コメントを入力..."
-                    style="width:100%;min-height:60px;font-size:13px;padding:6px;
-                           border-radius:8px;border:1px solid #e5e7eb;box-sizing:border-box;"></textarea>
-
-          <!-- @メンション候補 -->
-          <div id="mention-suggest"
-               style="position:absolute;left:8px;bottom:40px;z-index:1200;
-                      background:#ffffff;border:1px solid #e5e7eb;border-radius:8px;
-                      box-shadow:0 8px 16px rgba(0,0,0,.15);font-size:13px;
+@@ -1035,50 +1212,74 @@ if (empty($teamsList)) {
                       max-height:160px;overflow:auto;display:none;">
           </div>
         </div>
@@ -1056,6 +784,30 @@ if (empty($teamsList)) {
   window.toggleFilters = function(){
     toolbar.style.display = (toolbar.style.display==='block') ? 'none' : 'block';
   };
+
+  const assigneePickerRegistry = {};
+  const ASSIGNEE_OPTIONS = <?php
+    echo json_encode(
+      array_map(
+        fn($u) => ['id' => (int)$u['id'], 'name' => $u['display_name']],
+        $usersList
+      ),
+      JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES
+    );
+  ?>;
+  const ASSIGNEE_LOOKUP = {};
+  ASSIGNEE_OPTIONS.forEach(opt => { ASSIGNEE_LOOKUP[opt.id] = opt.name || ''; });
+
+  function escapeHtml(str){
+    if (!str) return '';
+    return String(str).replace(/[&<>"']/g, s => ({
+      '&':'&amp;',
+      '<':'&lt;',
+      '>':'&gt;',
+      '"':'&quot;',
+      "'":'&#39;'
+    }[s] || s));
+  }
 
   // ===== インライン更新はAJAX送信 =====
   async function submitInlineAjax(id, field, value){
@@ -1082,69 +834,7 @@ if (empty($teamsList)) {
   document.querySelectorAll('.js-inline-input').forEach(el=>{
     if(el.classList.contains('js-url-input')) return;
     if(el.tagName==='INPUT' && el.type==='text'){ el.addEventListener('keydown',e=>{ if(e.key==='Enter'){ e.preventDefault(); handleChange(e); }}); el.addEventListener('blur',handleChange); }
-    else if(el.tagName==='INPUT' && el.type==='date'){ el.addEventListener('change',handleChange); }
-    else if(el.tagName==='SELECT'){ el.addEventListener('change',handleChange); }
-  });
-
-  // 色付きセレクト（未設定=#d9d9d9）
-  function setSelectColor(sel){
-    const opt = sel.options[sel.selectedIndex];
-    const color = opt && opt.dataset.color ? opt.dataset.color : '';
-    if(color){
-      sel.style.backgroundColor = color;
-      try{
-        const c=color.replace('#',''); const r=parseInt(c.substr(0,2),16), g=parseInt(c.substr(2,2),16), b=parseInt(c.substr(4,2),16);
-        const L=(0.299*r+0.587*g+0.114*b); sel.style.color = L < 140 ? '#fff':'#111';
-      }catch(e){ sel.style.color='#111'; }
-    }else{
-      sel.style.backgroundColor = '#fff'; sel.style.color = '#111';
-    }
-  }
-  document.querySelectorAll('select.js-colored').forEach(sel=>{ setSelectColor(sel); sel.addEventListener('change',e=>{ setSelectColor(e.target); handleChange(e); }); });
-
-  // URL：Ctrl+クリックで開く、通常は編集
-  function normalizeUrl(s){
-    if(!s) return '';
-    const t=s.trim();
-    if(/^([a-zA-Z][a-zA-Z0-9+\-.]*):\/\//.test(t)) return t;
-    if(/^mailto:|^tel:/i.test(t)) return t;
-    return 'https://' + t;
-  }
-  document.querySelectorAll('.js-url-input').forEach(inp=>{
-    inp.addEventListener('keydown',e=>{ if(e.key==='Enter'){ e.preventDefault(); handleChange(e); }});
-    inp.addEventListener('blur',handleChange);
-    inp.addEventListener('mousedown',e=>{
-      if(e.ctrlKey){ e.preventDefault(); const url = normalizeUrl(inp.value); if(url) window.open(url,'_blank'); }
-    });
-  });
-
-// 説明：モーダル編集
-const modal=document.getElementById('descModal'); const ta=document.getElementById('descTextarea');
-const btnC=document.getElementById('descCancel'); const btnS=document.getElementById('descSave'); let currentId=null;
-
-document.querySelectorAll('.js-desc-input').forEach(el=>{
-  el.addEventListener('focus',e=>{
-    currentId = e.target.dataset.id;
-    ta.value  = e.target.value || '';
-    modal.style.display = 'flex';
-    e.target.blur();
-  });
-});
-
-btnC.addEventListener('click',()=>{
-  modal.style.display = 'none';
-  currentId = null;
-});
-
-modal.addEventListener('click',e=>{
-  if(e.target === modal){
-    modal.style.display = 'none';
-    currentId = null;
-  }
-});
-
-// ★ここを修正
-btnS.addEventListener('click',()=>{
+@@ -1148,52 +1349,276 @@ btnS.addEventListener('click',()=>{
   if (!currentId) return;
 
   // 一覧の説明入力欄も即座に更新する
@@ -1170,8 +860,233 @@ btnS.addEventListener('click',()=>{
     sel.addEventListener('keydown', (e)=>{ if(e.key==='Enter'){ e.preventDefault(); } });
   });
 
+  class AssigneePicker {
+    constructor(el, options = {}){
+      this.el = el;
+      this.options = options;
+      this.mode = el.dataset.mode || 'form';
+      this.name = el.dataset.name || '';
+      this.placeholder = el.dataset.placeholder || '担当者を選択';
+      this.selected = this.parseValue(el.dataset.value);
+      this.prevSerialized = JSON.stringify(this.selected);
+      this.extraLabels = this.parseLabels(el.dataset.extraLabels);
+      this.legacyLabels = this.parseLegacy(el.dataset.legacyLabels);
+      this.hiddenWrap = el.querySelector('.assignee-picker-hidden') || null;
+      const fallback = el.querySelector('.assignee-picker-fallback');
+      if (fallback) fallback.remove();
+      this.build();
+      this.render();
+    }
+    parseValue(str){
+      if (!str) return [];
+      try{
+        const arr = JSON.parse(str);
+        if (Array.isArray(arr)){
+          const uniq = [];
+          arr.forEach(v=>{
+            const id = parseInt(v,10);
+            if (id > 0 && !uniq.includes(id)) uniq.push(id);
+          });
+          return uniq;
+        }
+      }catch(e){}
+      return [];
+    }
+    parseLabels(str){
+      if (!str) return {};
+      try{
+        const obj = JSON.parse(str);
+        return (obj && typeof obj === 'object') ? obj : {};
+      }catch(e){ return {}; }
+    }
+    parseLegacy(str){
+      if (!str) return [];
+      try{
+        const arr = JSON.parse(str);
+        return Array.isArray(arr) ? arr.map(v => String(v)) : [];
+      }catch(e){ return []; }
+    }
+    getSelectedIds(){ return this.selected.slice(); }
+    getLabel(id){ return this.extraLabels[id] || ASSIGNEE_LOOKUP[id] || `ID:${id}`; }
+    build(){
+      this.display = document.createElement('div');
+      this.display.className = 'assignee-picker-display';
+      if (this.hiddenWrap){
+        this.el.insertBefore(this.display, this.hiddenWrap);
+      } else if (this.el.firstChild){
+        this.el.insertBefore(this.display, this.el.firstChild);
+      } else {
+        this.el.appendChild(this.display);
+      }
+      this.dropdown = document.createElement('div');
+      this.dropdown.className = 'assignee-picker-dropdown';
+      this.searchInput = document.createElement('input');
+      this.searchInput.type = 'text';
+      this.searchInput.className = 'assignee-picker-search';
+      this.searchInput.placeholder = '名前で検索';
+      this.dropdown.appendChild(this.searchInput);
+      this.optionsList = document.createElement('div');
+      this.optionsList.className = 'assignee-picker-options';
+      this.dropdown.appendChild(this.optionsList);
+      this.el.appendChild(this.dropdown);
+      this.display.addEventListener('click', (e)=>{ e.stopPropagation(); this.toggleDropdown(); });
+      this.dropdown.addEventListener('click', e=>{ e.stopPropagation(); });
+      this.searchInput.addEventListener('input', ()=>this.renderOptions());
+      this.outsideHandler = (e)=>{ if (!this.el.contains(e.target)) this.toggleDropdown(false); };
+    }
+    toggleDropdown(force){
+      const shouldOpen = typeof force === 'boolean' ? force : !this.dropdown.classList.contains('show');
+      if (shouldOpen){
+        this.dropdown.classList.add('show');
+        this.searchInput.value = '';
+        this.renderOptions();
+        setTimeout(()=>this.searchInput.focus(), 0);
+        document.addEventListener('click', this.outsideHandler);
+      }else{
+        this.dropdown.classList.remove('show');
+        document.removeEventListener('click', this.outsideHandler);
+      }
+    }
+    render(){
+      this.renderDisplay();
+      this.updateHiddenInputs();
+      if (this.dropdown.classList.contains('show')) this.renderOptions();
+    }
+    renderDisplay(){
+      this.display.innerHTML = '';
+      if (!this.selected.length && (!this.legacyLabels || !this.legacyLabels.length)){
+        const span = document.createElement('span');
+        span.className = 'placeholder';
+        span.textContent = this.placeholder;
+        this.display.appendChild(span);
+        return;
+      }
+      this.selected.forEach(id=>{
+        const pill = document.createElement('span');
+        pill.className = 'assignee-pill';
+        const label = document.createElement('span');
+        label.textContent = this.getLabel(id);
+        pill.appendChild(label);
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.textContent = '×';
+        btn.addEventListener('click', (e)=>{ e.stopPropagation(); this.remove(id); });
+        pill.appendChild(btn);
+        this.display.appendChild(pill);
+      });
+      if (this.legacyLabels && this.legacyLabels.length){
+        this.legacyLabels.forEach(text=>{
+          const legacy = document.createElement('span');
+          legacy.className = 'assignee-pill';
+          legacy.textContent = text;
+          this.display.appendChild(legacy);
+        });
+      }
+      if (this.mode !== 'inline') {
+        const hint = document.createElement('span');
+        hint.className = 'placeholder';
+        hint.textContent = '＋ 追加';
+        this.display.appendChild(hint);
+      }
+    }
+    updateHiddenInputs(){
+      if (!this.name) return;
+      if (!this.hiddenWrap){
+        this.hiddenWrap = document.createElement('div');
+        this.hiddenWrap.className = 'assignee-picker-hidden';
+        this.el.appendChild(this.hiddenWrap);
+      }
+      this.hiddenWrap.innerHTML = '';
+      this.selected.forEach(id=>{
+        const input = document.createElement('input');
+        input.type = 'hidden';
+        input.name = this.name;
+        input.value = id;
+        this.hiddenWrap.appendChild(input);
+      });
+    }
+    renderOptions(){
+      this.optionsList.innerHTML = '';
+      const q = (this.searchInput.value || '').trim().toLowerCase();
+      const list = ASSIGNEE_OPTIONS.filter(u => {
+        if (!q) return true;
+        return (u.name || '').toLowerCase().includes(q);
+      });
+      if (!list.length){
+        const empty = document.createElement('div');
+        empty.style.padding = '12px';
+        empty.style.fontSize = '12px';
+        empty.style.color = '#9ca3af';
+        empty.textContent = '該当する担当者がいません';
+        this.optionsList.appendChild(empty);
+        return;
+      }
+      list.forEach(u=>{
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'assignee-option' + (this.selected.includes(u.id) ? ' active' : '');
+        const label = document.createElement('span');
+        label.textContent = u.name || '（名称未設定）';
+        const mark = document.createElement('span');
+        mark.textContent = this.selected.includes(u.id) ? '✓' : '';
+        btn.append(label, mark);
+        btn.addEventListener('click', (e)=>{ e.preventDefault(); this.toggleSelection(u.id); });
+        this.optionsList.appendChild(btn);
+      });
+    }
+    toggleSelection(id){
+      if (this.selected.includes(id)){
+        this.selected = this.selected.filter(v => v !== id);
+      } else {
+        this.selected = [...this.selected, id];
+      }
+      if (this.legacyLabels && this.legacyLabels.length) {
+        this.legacyLabels = [];
+      }
+      this.render();
+      this.notifyChange();
+    }
+    remove(id){
+      if (!this.selected.includes(id)) return;
+      this.selected = this.selected.filter(v => v !== id);
+      if (this.legacyLabels && this.legacyLabels.length) {
+        this.legacyLabels = [];
+      }
+      this.render();
+      this.notifyChange();
+    }
+    notifyChange(){
+      const serialized = JSON.stringify(this.selected);
+      if (serialized === this.prevSerialized) return;
+      this.prevSerialized = serialized;
+      if (typeof this.options.onChange === 'function') {
+        this.options.onChange(this.getSelectedIds());
+      }
+    }
+  }
+
+  function initAssigneePickers(){
+    document.querySelectorAll('[data-assignee-picker]').forEach(el=>{
+      if (el.__picker) return;
+      const picker = new AssigneePicker(el, {
+        onChange: (ids)=>{
+          if (el.dataset.mode === 'inline') {
+            const taskId = el.dataset.taskId;
+            if (taskId) submitInlineAjax(taskId, 'assignees', JSON.stringify(ids));
+          }
+        }
+      });
+      el.__picker = picker;
+      const pid = el.dataset.pickerId || '';
+      if (pid) assigneePickerRegistry[pid] = picker;
+    });
+  }
+
+  initAssigneePickers();
+
   // ====== ここからビュー＆詳細共通関数 ======
     const CURRENT_TEAM_ID = <?php echo (int)$team_id; ?>;
+  const CURRENT_TEAM_ID = <?php echo (int)$team_id; ?>;
   const MENTION_USERS = <?php
     echo json_encode(
       array_map(
@@ -1197,35 +1112,7 @@ btnS.addEventListener('click',()=>{
   const viewSelectEl = document.getElementById('viewSelect');
   if (viewSelectEl){
     viewSelectEl.addEventListener('change', ()=>{
-      if (!viewSelectEl.value) return;
-      const form = document.getElementById('applyViewForm');
-      if (!form) return;
-      form.submit();
-    });
-  }
-
-  function rebuildViewSelect(views){
-    const sel = document.getElementById('viewSelect');
-    if (!sel) return;
-
-    sel.innerHTML = '';
-    if (!views || !views.length){
-      const opt = document.createElement('option');
-      opt.value = '';
-      opt.textContent = '保存ビューはありません';
-      sel.appendChild(opt);
-      return;
-    }
-    views.forEach(v=>{
-      const opt = document.createElement('option');
-      opt.value = v.id;
-      opt.textContent = (v.is_default ? '★ ' : '') + v.name;
-      sel.appendChild(opt);
-    });
-  }
-
-  // ビュー保存（ページリロード無し）
-  window.saveCurrentView = async function(){
+@@ -1229,54 +1654,56 @@ btnS.addEventListener('click',()=>{
     const nameInput = document.getElementById('viewNameInput');
     const viewName  = nameInput && nameInput.value ? nameInput.value.trim() : '';
     if (!viewName){
@@ -1255,6 +1142,9 @@ btnS.addEventListener('click',()=>{
     collectMulti('status_ids[]',  'status_ids');
     collectMulti('priority_ids[]','priority_ids');
     collectMulti('type_ids[]',    'type_ids');
+    if (assigneePickerRegistry['filter-assignees']) {
+      params.assignee_ids = assigneePickerRegistry['filter-assignees'].getSelectedIds();
+    }
 
     try{
       const j = await fetchJson('api/views.php', {
@@ -1280,205 +1170,7 @@ btnS.addEventListener('click',()=>{
   window.setDefaultFromSelect = async function(){
     const sel = document.getElementById('viewSelect');
     if (!sel || !sel.value){
-      alert('既定にするビューを選択してください。');
-      return;
-    }
-    try{
-      const j = await fetchJson('api/views.php', {
-        action : 'set_default',
-        team_id: CURRENT_TEAM_ID,
-        id     : sel.value
-      });
-      if (!j.ok){
-        alert(j.error || '既定ビューの設定に失敗しました');
-        return;
-      }
-      rebuildViewSelect(j.views || []);
-      alert('既定ビューを更新しました');
-    }catch(e){
-      console.error(e);
-      alert('通信エラーにより既定ビューの設定に失敗しました');
-    }
-  };
-
-  // ===== ビュー「削除」 =====
-  window.deleteFromSelect = async function(){
-    const sel = document.getElementById('viewSelect');
-    if (!sel || !sel.value){
-      alert('削除するビューを選択してください。');
-      return;
-    }
-    if (!confirm('選択中のビューを削除しますか？')) return;
-    try{
-      const j = await fetchJson('api/views.php', {
-        action : 'delete',
-        team_id: CURRENT_TEAM_ID,
-        id     : sel.value
-      });
-      if (!j.ok){
-        alert(j.error || 'ビューの削除に失敗しました');
-        return;
-      }
-      rebuildViewSelect(j.views || []);
-      alert('ビューを削除しました');
-    }catch(e){
-      console.error(e);
-      alert('通信エラーによりビューの削除に失敗しました');
-    }
-  };
-
-  // ===== タスク詳細モーダル =====
-  const detailModal  = document.getElementById('taskDetailModal');
-  const detailClose  = document.getElementById('taskDetailClose');
-  const detailTitle  = document.getElementById('td-title');
-  const detailAss    = document.getElementById('td-assignee');
-  const detailStatus = document.getElementById('td-status');
-  const detailPrio   = document.getElementById('td-priority');
-  const detailType   = document.getElementById('td-type');
-  const detailDue    = document.getElementById('td-due');
-  const detailUrl    = document.getElementById('td-url');
-  const detailDesc   = document.getElementById('td-desc');
-  const detailComments = document.getElementById('td-comments');
-  const detailLogs     = document.getElementById('td-logs');
-  const commentInput   = document.getElementById('td-comment-input');
-  const commentSendBtn = document.getElementById('td-comment-send');
-
-  let currentDetailTaskId = null;
-
-  function openDetailModal(){
-    if (!detailModal) return;
-    detailModal.style.display = 'flex';
-  }
-  function closeDetailModal(){
-    if (!detailModal) return;
-
-    // ① まず確実にモーダルを閉じる
-    detailModal.style.display = 'none';
-
-    // ② 内部状態をリセット
-    currentDetailTaskId = null;
-    if (commentInput)   commentInput.value = '';
-    if (detailComments) detailComments.innerHTML = '';
-    if (detailLogs)     detailLogs.innerHTML = '';
-
-    // ③ URL パラメータ（task_id / open_task）を削除
-    //    ※ ここでエラーが出てもモーダル閉じ処理には影響しないように try/catch で保護
-    try {
-      const url = new URL(window.location.href);
-      let changed = false;
-
-      if (url.searchParams.has('task_id')) {
-        url.searchParams.delete('task_id');
-        changed = true;
-      }
-      if (url.searchParams.has('open_task')) {
-        url.searchParams.delete('open_task');
-        changed = true;
-      }
-
-      if (changed) {
-        const qs     = url.searchParams.toString();
-        const newUrl = url.pathname + (qs ? '?' + qs : '');
-        window.history.replaceState({}, '', newUrl);
-      }
-    } catch (e) {
-      console.error('URL パラメータ削除時にエラー', e);
-      // ここは握りつぶす：モーダルが閉じることを最優先
-    }
-  }
-
-  // ★ここを新しく追加する
-  if (detailClose){
-    detailClose.addEventListener('click', closeDetailModal);
-  }
-  if (detailModal){
-    detailModal.addEventListener('click', (e)=>{
-      // 背景（オーバーレイ）そのものをクリックしたときだけ閉じる
-      if (e.target === detailModal){
-        closeDetailModal();
-      }
-    });
-  }
-
-  function renderComments(list){
-    if (!detailComments) return;
-    if (!list || !list.length){
-      detailComments.innerHTML = '<div style="color:#9ca3af;">コメントはまだありません。</div>';
-      return;
-    }
-    detailComments.innerHTML = list.map(c=>{
-      const name = c.display_name || '（不明）';
-      const date = c.created_at || '';
-      const safeBody = (c.body || '')
-        .replace(/&/g,'&amp;')
-        .replace(/</g,'&lt;')
-        .replace(/>/g,'&gt;')
-        .replace(/\n/g,'<br>');
-
-      const isMine = c.is_mine == 1;
-      const menuHtml = isMine ? `
-        <div class="td-comment-menu-wrap">
-          <button type="button" class="td-comment-menu-btn">⋯</button>
-          <div class="td-comment-menu-popover">
-            <button type="button" class="td-comment-edit">編集</button>
-            <button type="button" class="td-comment-delete">削除</button>
-          </div>
-        </div>
-      ` : '';
-
-      return `
-        <div class="td-comment-item${isMine ? ' mine' : ''}" data-comment-id="${c.id}">
-          <div class="td-comment-main">
-            <div class="td-comment-meta">
-              <span class="td-comment-author">${name}</span>
-              <span class="td-comment-date">${date}</span>
-            </div>
-            <div class="td-comment-body">${safeBody}</div>
-          </div>
-          ${menuHtml}
-        </div>
-      `;
-    }).join('');
-  }
-
-
-  function renderLogs(list){
-    if (!detailLogs) return;
-    if (!list || !list.length){
-      detailLogs.innerHTML = '<div style="color:#9ca3af;">履歴はまだありません。</div>';
-      return;
-    }
-    const fieldLabel = (f)=>{
-      if (!f) return '';
-      switch(f){
-        case 'title': return 'タイトル';
-        case 'assignee': return '担当者';
-        case 'status_id': return 'ステータス';
-        case 'priority_id': return '優先度';
-        case 'type_id': return '種別';
-        case 'due_date': return '期日';
-        case 'description': return '説明';
-        case 'url': return 'URL';
-        default: return f;
-      }
-    };
-    detailLogs.innerHTML = list.map(l=>{
-      const name = l.display_name || '（不明）';
-      const date = l.created_at || '';
-      const action = l.action;
-      let text = '';
-      if (action === 'create'){
-        text = 'タスクを作成';
-      } else if (action === 'delete'){
-        text = 'タスクを削除';
-      } else if (action === 'comment'){
-        text = 'コメントを追加';
-      } else if (action === 'update'){
-        const fl = fieldLabel(l.field);
-        const ov = (l.old_value || '').replace(/\r?\n/g,' ');
-        const nv = (l.new_value || '').replace(/\r?\n/g,' ');
-        text = `${fl} を「${ov}」→「${nv}」に変更`;
-      } else {
+@@ -1482,51 +1909,56 @@ btnS.addEventListener('click',()=>{
         text = action || '';
       }
       return `
@@ -1505,6 +1197,12 @@ btnS.addEventListener('click',()=>{
 
       detailTitle.textContent = t.title || '';
       detailAss.textContent   = t.assignee_name || '未設定';
+      const assigneesForDetail = Array.isArray(t.assignees) ? t.assignees : [];
+      if (detailAss) {
+        detailAss.innerHTML = assigneesForDetail.length
+          ? assigneesForDetail.map(a=>`<span class="assignee-pill">${escapeHtml(a.name || '（不明）')}</span>`).join('')
+          : '<span class="assignee-pill" style="background:#e5e7eb;color:#4b5563;">未設定</span>';
+      }
       detailStatus.textContent= t.status_name   || '未設定';
       detailPrio.textContent  = t.priority_name || '未設定';
       detailType.textContent  = t.type_name     || '未設定';

@@ -1,5 +1,6 @@
 <?php
 require_once __DIR__.'/../config.php';
+require_once __DIR__.'/../lib/task_assignees.php';
 header('Content-Type: application/json; charset=utf-8');
 
 $user = current_user();
@@ -51,7 +52,20 @@ try{
     where_in_or_null($where,$params,'t.status_id',   $status_ids,$status_null);
     where_in_or_null($where,$params,'t.priority_id', $priority_ids,$priority_null);
     where_in_or_null($where,$params,'t.type_id',     $type_ids,$type_null);
-    where_in_or_null($where,$params,'t.assignee_id', $assignee_ids,$assignee_null);
+    if ($assignee_ids){
+      $names = [];
+      foreach ($assignee_ids as $i => $val){
+        $names[] = '?';
+        $params[] = (int)$val;
+      }
+      $where[] = "EXISTS (
+        SELECT 1 FROM task_assignees ta
+        WHERE ta.task_id = t.id
+          AND ta.user_id IN (".implode(',', $names).")
+      )";
+    } elseif ($assignee_null){
+      $where[] = "NOT EXISTS (SELECT 1 FROM task_assignees ta WHERE ta.task_id = t.id)";
+    }
 
     $sql = "
       SELECT
@@ -69,14 +83,32 @@ try{
 
     $stmt = $pdo->prepare($sql);
     $stmt->execute($params);
-    echo json_encode(['ok'=>true,'rows'=>$stmt->fetchAll(PDO::FETCH_ASSOC)]);
+    $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
+    if ($rows){
+      $taskIds = array_map(fn($r)=>(int)$r['id'], $rows);
+      $assignees = fetch_task_assignees($pdo, $taskIds);
+      foreach ($rows as &$row){
+        $tid = (int)$row['id'];
+        $row['assignees'] = $assignees[$tid] ?? [];
+      }
+      unset($row);
+    }
+    echo json_encode(['ok'=>true,'rows'=>$rows]);
     exit;
   }
 
   if ($act === 'create'){
     $title       = trim($in['title'] ?? '');
     if ($title === ''){ echo json_encode(['ok'=>false,'error'=>'title_required']); exit; }
-    $assignee_id = nullIfEmpty($in['assignee_id'] ?? null);
+    $assignee_inputs = $in['assignee_ids'] ?? [];
+    if (!is_array($assignee_inputs)) {
+      $assignee_inputs = [$assignee_inputs];
+    }
+    if (empty($assignee_inputs) && !empty($in['assignee_id'])) {
+      $assignee_inputs[] = $in['assignee_id'];
+    }
+    $assignee_ids = normalize_user_ids($assignee_inputs);
+    $primary_assignee_id = $assignee_ids[0] ?? null;
     $status_id   = nullIfEmpty($in['status_id']   ?? null);
     $priority_id = nullIfEmpty($in['priority_id'] ?? null);
     $type_id     = nullIfEmpty($in['type_id']     ?? null);
@@ -85,9 +117,9 @@ try{
 
     // assignee_name は users から補完（NULL 可）
     $assignee_name = null;
-    if ($assignee_id){
+    if ($primary_assignee_id){
       $u = $pdo->prepare("SELECT display_name FROM users WHERE id=?");
-      $u->execute([(int)$assignee_id]);
+      $u->execute([(int)$primary_assignee_id]);
       $assignee_name = $u->fetchColumn() ?: null;
     }
 
@@ -98,8 +130,19 @@ try{
         (1,?,?,?,?,?,?,?,NOW(),NOW(),?)
     ");
     $stmt->execute([
-      $status_id,$priority_id,$type_id,$assignee_id,$assignee_name,$due_date,(int)$user['id']
+      $status_id,$priority_id,$type_id,$primary_assignee_id,$assignee_name,$due_date,(int)$user['id']
     ]);
+    $newTaskId = (int)$pdo->lastInsertId();
+    $syncedAssignees = sync_task_assignees($pdo, $newTaskId, $assignee_ids);
+    $primaryAfter = $syncedAssignees['primary'] ?? null;
+    if ($primaryAfter || $primary_assignee_id !== null){
+      $pdo->prepare('UPDATE tasks SET assignee_id=?, assignee_name=? WHERE id=?')
+          ->execute([
+            $primaryAfter['id'] ?? null,
+            $primaryAfter['name'] ?? null,
+            $newTaskId
+          ]);
+    }
     echo json_encode(['ok'=>true]); exit;
   }
 
@@ -107,18 +150,38 @@ try{
     $id          = (int)($in['id'] ?? 0);
     if ($id<=0){ echo json_encode(['ok'=>false,'error'=>'bad_id']); exit; }
     $title       = trim($in['title'] ?? '');
-    $assignee_id = nullIfEmpty($in['assignee_id'] ?? null);
     $status_id   = nullIfEmpty($in['status_id']   ?? null);
     $priority_id = nullIfEmpty($in['priority_id'] ?? null);
     $type_id     = nullIfEmpty($in['type_id']     ?? null);
     $due_date    = trim($in['due_date'] ?? '');
     $due_date    = ($due_date==='') ? null : $due_date;
 
-    $assignee_name = null;
-    if ($assignee_id){
-      $u = $pdo->prepare("SELECT display_name FROM users WHERE id=?");
-      $u->execute([(int)$assignee_id]);
-      $assignee_name = $u->fetchColumn() ?: null;
+    $current = $pdo->prepare('SELECT assignee_id, assignee_name FROM tasks WHERE id=?');
+    $current->execute([$id]);
+    $currentRow = $current->fetch(PDO::FETCH_ASSOC);
+    if (!$currentRow){ echo json_encode(['ok'=>false,'error'=>'not_found']); exit; }
+
+    $primary_assignee_id = isset($currentRow['assignee_id']) ? (int)$currentRow['assignee_id'] : null;
+    $assignee_name = $currentRow['assignee_name'] ?? null;
+    $syncList = null;
+    $shouldTouchAssignees = array_key_exists('assignee_ids', $in) || array_key_exists('assignee_id', $in);
+
+    if ($shouldTouchAssignees){
+      $assignee_inputs = $in['assignee_ids'] ?? [];
+      if (!is_array($assignee_inputs)) {
+        $assignee_inputs = [$assignee_inputs];
+      }
+      if (empty($assignee_inputs) && isset($in['assignee_id'])) {
+        $assignee_inputs[] = $in['assignee_id'];
+      }
+      $syncList = normalize_user_ids($assignee_inputs);
+      $primary_assignee_id = $syncList[0] ?? null;
+      $assignee_name = null;
+      if ($primary_assignee_id){
+        $u = $pdo->prepare("SELECT display_name FROM users WHERE id=?");
+        $u->execute([(int)$primary_assignee_id]);
+        $assignee_name = $u->fetchColumn() ?: null;
+      }
     }
 
     $stmt = $pdo->prepare("
@@ -129,8 +192,11 @@ try{
       WHERE id=?
     ");
     $stmt->execute([
-      $title,$status_id,$priority_id,$type_id,$assignee_id,$assignee_name,$due_date,(int)$user['id'],$id
+      $title,$status_id,$priority_id,$type_id,$primary_assignee_id,$assignee_name,$due_date,(int)$user['id'],$id
     ]);
+    if ($syncList !== null){
+      sync_task_assignees($pdo, $id, $syncList);
+    }
     echo json_encode(['ok'=>true]); exit;
   }
 
