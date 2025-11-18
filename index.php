@@ -14,6 +14,52 @@ $team_id = null;
 
 function h($s){ return htmlspecialchars((string)$s, ENT_QUOTES, 'UTF-8'); }
 
+function normalize_assignee_ids($input): array {
+  if (is_string($input) || is_numeric($input)) {
+    $input = [$input];
+  }
+  if (!is_array($input)) {
+    return [];
+  }
+  $ids = [];
+  foreach ($input as $v) {
+    $n = (int)$v;
+    if ($n > 0 && !in_array($n, $ids, true)) {
+      $ids[] = $n;
+    }
+  }
+  return $ids;
+}
+
+function fetch_user_names(PDO $pdo, array $ids): array {
+  if (!$ids) return [];
+  $in = implode(',', array_fill(0, count($ids), '?'));
+  $st = $pdo->prepare("SELECT id, display_name FROM users WHERE id IN ($in)");
+  $st->execute($ids);
+  $map = [];
+  while ($r = $st->fetch(PDO::FETCH_ASSOC)) {
+    $map[(int)$r['id']] = $r['display_name'] ?? '';
+  }
+  return $map;
+}
+
+function sync_task_assignees(PDO $pdo, int $task_id, array $assignee_ids): void {
+  $pdo->prepare('DELETE FROM task_assignees WHERE task_id = :tid')->execute([':tid' => $task_id]);
+  if (!$assignee_ids) return;
+
+  $st = $pdo->prepare('
+    INSERT INTO task_assignees (task_id, user_id, is_primary, created_at)
+    VALUES (:task_id, :user_id, :is_primary, NOW())
+  ');
+  foreach ($assignee_ids as $idx => $uid) {
+    $st->execute([
+      ':task_id'   => $task_id,
+      ':user_id'   => (int)$uid,
+      ':is_primary'=> $idx === 0 ? 1 : 0,
+    ]);
+  }
+}
+
 // 変更履歴用の共通関数
 function add_task_log(PDO $pdo, int $task_id, int $user_id, string $action, ?string $field, ?string $old, ?string $new){
   $st = $pdo->prepare("
@@ -128,8 +174,8 @@ if (empty($teamsList)) {
     $action = $_POST['action'] ?? '';
 
     if ($action === 'add') {
-      $title       = trim($_POST['title'] ?? '');
-      $assignee_id = ($_POST['assignee_id'] ?? '') !== '' ? (int)$_POST['assignee_id'] : null;
+      $title        = trim($_POST['title'] ?? '');
+      $assignee_ids = normalize_assignee_ids($_POST['assignee_ids'] ?? ($_POST['assignee_id'] ?? []));
       $status_id   = ($_POST['status_id']   ?? '') !== '' ? (int)$_POST['status_id']   : null; // ← 未設定許可
       $due         = $_POST['due_date'] ?? '';
       $priority_id = isset($_POST['priority_id']) && $_POST['priority_id']!=='' ? (int)$_POST['priority_id'] : null;
@@ -139,12 +185,10 @@ if (empty($teamsList)) {
         $error = 'タスク名を入力してください。';
       } else {
         $now = date('Y-m-d H:i:s');
-        $assignee_name = null;
-        if ($assignee_id !== null) {
-          $st = $pdo->prepare('SELECT display_name FROM users WHERE id=:id');
-          $st->execute([':id'=>$assignee_id]);
-          if ($r = $st->fetch()) $assignee_name = $r['display_name']; else $assignee_id = $assignee_name = null;
-        }
+        $assignee_map = fetch_user_names($pdo, $assignee_ids);
+        $assignee_ids = array_values(array_filter($assignee_ids, fn($id) => isset($assignee_map[$id])));
+        $primary_assignee_id = $assignee_ids[0] ?? null;
+        $assignee_name = $primary_assignee_id ? ($assignee_map[$primary_assignee_id] ?? null) : null;
         $pdo->prepare(
           'INSERT INTO tasks
             (team_id, title, status_id, assignee_id, assignee_name,
@@ -156,7 +200,7 @@ if (empty($teamsList)) {
              :updated_at,:created_at,:updated_by)'
         )->execute([
           ':team_id'=>$team_id, ':title'=>$title, ':status_id'=>$status_id,
-          ':assignee_id'=>$assignee_id, ':assignee_name'=>$assignee_name,
+          ':assignee_id'=>$primary_assignee_id, ':assignee_name'=>$assignee_name,
           ':due_date'=>$due!=='' ? $due : null,
           ':priority_id'=>$priority_id, ':type_id'=>$type_id,
           ':updated_at'=>$now, ':created_at'=>$now, ':updated_by'=>$uid
@@ -164,9 +208,78 @@ if (empty($teamsList)) {
 
         // 作成ログ
         $newId = (int)$pdo->lastInsertId();
+        if ($assignee_ids) {
+          sync_task_assignees($pdo, $newId, $assignee_ids);
+        }
         add_task_log($pdo, $newId, $uid, 'create', null, null, 'タスクを作成');
 
         $message = 'タスクを追加しました。';
+      }
+
+    } elseif ($action === 'update_assignees' && isset($_POST['task_id'])) {
+      $isAjax = isset($_POST['ajax']) && $_POST['ajax'] === '1';
+      $task_id = (int)$_POST['task_id'];
+      $assignee_ids = normalize_assignee_ids($_POST['assignee_ids'] ?? []);
+      $resp = ['ok'=>false,'msg'=>''];
+
+      $stBefore = $pdo->prepare('SELECT * FROM tasks WHERE id=:id');
+      $stBefore->execute([':id'=>$task_id]);
+      $beforeTask = $stBefore->fetch(PDO::FETCH_ASSOC);
+
+      if (!$beforeTask) {
+        $resp['msg'] = 'タスクが見つかりません。';
+      } else {
+        $assignee_map = fetch_user_names($pdo, $assignee_ids);
+        $assignee_ids = array_values(array_filter($assignee_ids, fn($id) => isset($assignee_map[$id])));
+        $primary_assignee_id = $assignee_ids[0] ?? null;
+        $assignee_name = $primary_assignee_id ? ($assignee_map[$primary_assignee_id] ?? null) : null;
+        $now = date('Y-m-d H:i:s');
+
+        $pdo->prepare('UPDATE tasks SET assignee_id=:aid, assignee_name=:an, updated_at=:u, updated_by=:ub WHERE id=:id')
+            ->execute([':aid'=>$primary_assignee_id, ':an'=>$assignee_name, ':u'=>$now, ':ub'=>$uid, ':id'=>$task_id]);
+
+        $stOldAss = $pdo->prepare('SELECT ta.user_id, u.display_name FROM task_assignees ta LEFT JOIN users u ON ta.user_id = u.id WHERE ta.task_id = :id ORDER BY ta.is_primary DESC, u.display_name ASC');
+        $stOldAss->execute([':id'=>$task_id]);
+        $oldNames = [];
+        while ($row = $stOldAss->fetch(PDO::FETCH_ASSOC)) {
+          $oldNames[] = $row['display_name'] ?: '未登録';
+        }
+        if (!$oldNames && !empty($beforeTask['assignee_name'])) {
+          $oldNames[] = $beforeTask['assignee_name'];
+        }
+
+        sync_task_assignees($pdo, $task_id, $assignee_ids);
+
+        $newNames = [];
+        foreach ($assignee_ids as $aid) {
+          $newNames[] = $assignee_map[$aid] ?? ('ID:'.$aid);
+        }
+
+        $oldText = $oldNames ? implode(', ', $oldNames) : '未設定';
+        $newText = $newNames ? implode(', ', $newNames) : '未設定';
+        if ($oldText !== $newText) {
+          add_task_log($pdo, $task_id, $uid, 'update', 'assignee', $oldText, $newText);
+        }
+
+        $resp = [
+          'ok' => true,
+          'msg'=> '担当者を更新しました。',
+          'assignees' => array_map(fn($aid) => ['id'=>$aid, 'name'=>$assignee_map[$aid] ?? ''], $assignee_ids),
+          'primary_id' => $primary_assignee_id,
+          'primary_name' => $assignee_name,
+        ];
+      }
+
+      if ($isAjax) {
+        header('Content-Type: application/json; charset=utf-8');
+        echo json_encode($resp, JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES);
+        exit;
+      }
+
+      if ($resp['ok']) {
+        $message = $resp['msg'];
+      } else {
+        $error = $resp['msg'];
       }
 
     } elseif ($action === 'update' && isset($_POST['task_id'], $_POST['field'])) {
@@ -200,6 +313,7 @@ if (empty($teamsList)) {
             }
             $pdo->prepare('UPDATE tasks SET assignee_id=:aid, assignee_name=:an, updated_at=:u, updated_by=:ub WHERE id=:id')
                 ->execute([':aid'=>$assignee_id, ':an'=>$assignee_name, ':u'=>$now, ':ub'=>$uid, ':id'=>$task_id]);
+            sync_task_assignees($pdo, $task_id, $assignee_id !== null ? [$assignee_id] : []);
             $resp = ['ok'=>true,'msg'=>'担当者を更新しました。','assignee_name'=>$assignee_name];
 
             // ログ：担当者
@@ -351,7 +465,20 @@ if (empty($teamsList)) {
     foreach ($vals as $i=>$v) { $n=":$prefix$i"; $names[]=$n; $binds[$n]=(int)$v; }
     $where[] = "$col IN (".implode(',', $names).")";
   };
-  $mkIn($f_assignees,  'assignee_', 't.assignee_id');
+  if ($f_assignees) {
+    $names = [];
+    foreach ($f_assignees as $i => $v) {
+      $n = ":assignee_$i";
+      $names[] = $n;
+      $binds[$n] = (int)$v;
+    }
+    $where[] = "EXISTS (
+      SELECT 1
+        FROM task_assignees ta
+       WHERE ta.task_id = t.id
+         AND ta.user_id IN (".implode(',', $names).")
+    )";
+  }
   $mkIn($f_statuses,   'status_',   't.status_id');
   $mkIn($f_priorities, 'priority_', 't.priority_id');
   $mkIn($f_types,      'type_',     't.type_id');
@@ -391,6 +518,32 @@ if (empty($teamsList)) {
   $st = $pdo->prepare($sql);
   $st->execute($binds);
   $tasks = $st->fetchAll();
+
+  $taskAssigneesMap = [];
+  $taskAssigneesForJs = [];
+  if (!empty($tasks)) {
+    $ids = array_map(fn($r)=>(int)$r['id'], $tasks);
+    $in  = implode(',', array_fill(0,count($ids),'?'));
+    $stAss = $pdo->prepare("SELECT ta.task_id, ta.user_id, ta.is_primary, u.display_name FROM task_assignees ta LEFT JOIN users u ON ta.user_id = u.id WHERE ta.task_id IN ($in) ORDER BY ta.is_primary DESC, u.display_name ASC");
+    $stAss->execute($ids);
+    while ($row = $stAss->fetch(PDO::FETCH_ASSOC)) {
+      $tid = (int)$row['task_id'];
+      $taskAssigneesMap[$tid][] = [
+        'id'   => (int)$row['user_id'],
+        'name' => $row['display_name'] ?: '未登録',
+      ];
+    }
+    foreach ($tasks as &$t) {
+      $tid = (int)$t['id'];
+      $t['assignees'] = $taskAssigneesMap[$tid] ?? [];
+    }
+    unset($t);
+    foreach ($taskAssigneesMap as $tid => $rows) {
+      $taskAssigneesForJs[$tid] = array_map(function($r){
+        return ['id'=>(int)$r['id'], 'name'=>$r['name']];
+      }, $rows);
+    }
+  }
 
   // 添付有無
   $filesMap = [];
@@ -464,6 +617,28 @@ if (empty($teamsList)) {
   .label{font-size:12px;color:#374151;}
   .input, .select{font-size:13px;padding:8px;border-radius:8px;border:1px solid var(--border);background:#fff;min-width:0;}
   .select[multiple]{min-height:96px;}
+  .multi-select-hidden{display:none !important;}
+  .multi-select-ui{border:1px solid var(--border);border-radius:8px;padding:4px;min-height:40px;display:flex;flex-wrap:wrap;gap:4px;cursor:text;position:relative;background:#fff;transition:border-color .2s,box-shadow .2s;}
+  .multi-select-ui.is-inline{min-height:32px;padding:2px 4px;font-size:12px;}
+  .multi-select-ui.is-disabled{background:#f3f4f6;cursor:not-allowed;}
+  .multi-select-ui.open{border-color:var(--accent);box-shadow:0 0 0 2px rgba(249,115,22,.15);}
+  .multi-select-values{display:flex;flex-wrap:wrap;gap:4px;align-items:center;width:100%;}
+  .multi-select-pill{background:#fee2c5;border-radius:999px;padding:2px 8px;display:flex;align-items:center;gap:4px;font-size:12px;line-height:1.3;color:#9a3412;}
+  .multi-select-ui.is-inline .multi-select-pill{background:#e0f2fe;color:#0369a1;}
+  .multi-select-pill button{border:none;background:none;cursor:pointer;font-size:12px;color:inherit;padding:0;}
+  .multi-select-placeholder{color:#9ca3af;font-size:12px;}
+  .multi-select-input-wrap{flex:1;min-width:120px;}
+  .multi-select-ui.is-inline .multi-select-input-wrap{min-width:80px;}
+  .multi-select-input{border:none;outline:none;width:100%;font-size:12px;background:transparent;padding:4px;}
+  .multi-select-dropdown{position:absolute;left:0;right:0;top:calc(100% + 4px);background:#fff;border:1px solid var(--border);border-radius:10px;box-shadow:0 16px 40px rgba(15,23,42,.15);max-height:240px;overflow:auto;display:none;z-index:40;}
+  .multi-select-ui.open .multi-select-dropdown{display:block;}
+  .multi-select-option{padding:8px 12px;display:flex;justify-content:space-between;align-items:center;font-size:13px;cursor:pointer;}
+  .multi-select-option:hover{background:#fff7ed;}
+  .multi-select-option.selected{background:#ffe0c3;}
+  .multi-select-option .multi-check{font-size:12px;color:var(--accent);opacity:0;transition:opacity .15s;}
+  .multi-select-option.selected .multi-check{opacity:1;}
+  .multi-select-empty{padding:12px;font-size:12px;color:#9ca3af;}
+  .multi-select-ui.is-loading{opacity:.6;pointer-events:none;}
   .filters-grid{display:grid;gap:10px;grid-template-columns: repeat(6, minmax(0,1fr));}
   .field{display:flex;flex-direction:column;gap:4px;min-width:0;}
   .filters-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:2px;}
@@ -695,7 +870,7 @@ if (empty($teamsList)) {
 
         <div class="field">
           <label class="label">担当者（複数可）</label>
-          <select class="select js-multi-click" name="assignee_ids[]" multiple>
+          <select class="select js-enhanced-multi" data-placeholder="担当者を検索" data-empty-text="未設定" name="assignee_ids[]" multiple>
             <?php foreach ($usersList as $u): $val=(int)$u['id']; ?>
               <option value="<?php echo $val; ?>" <?php if(in_array($val,$f_assignees,true)) echo 'selected'; ?>>
                 <?php echo h($u['display_name']); ?>
@@ -784,8 +959,7 @@ if (empty($teamsList)) {
       </div>
       <div class="add-field">
         <label class="label">担当者</label>
-        <select class="select" name="assignee_id">
-          <option value="">未設定</option>
+        <select class="select js-enhanced-multi" data-placeholder="担当者を検索" data-empty-text="未設定" name="assignee_ids[]" multiple>
           <?php foreach ($usersList as $u): ?>
             <option value="<?php echo (int)$u['id']; ?>"><?php echo h($u['display_name']); ?></option>
           <?php endforeach; ?>
@@ -855,21 +1029,13 @@ if (empty($teamsList)) {
           </td>
 
           <td class="fit center">
-            <select class="inline-select js-inline-input js-colored" data-id="<?php echo $tid; ?>" data-field="assignee_id">
-              <option value="" data-color="#d9d9d9" <?php echo $t['assignee_id']===null?'selected':''; ?>>未設定</option>
-              <?php
-                $hasSelected=false;
-                foreach ($usersList as $u):
-                  $uid2=(int)$u['id']; $sel=($t['assignee_id']!==null && (int)$t['assignee_id']===$uid2);
-                  if ($sel) $hasSelected=true;
-              ?>
-                <option value="<?php echo $uid2; ?>" data-color="#ffffff" <?php if($sel) echo 'selected'; ?>>
+            <?php $selectedIds = array_map(function($a){ return (int)$a['id']; }, $taskAssigneesMap[$tid] ?? []); ?>
+            <select class="inline-select js-enhanced-multi js-inline-assignees" data-task-id="<?php echo $tid; ?>" data-mode="inline" data-placeholder="担当者を検索" data-empty-text="未設定" multiple>
+              <?php foreach ($usersList as $u): $uid2=(int)$u['id']; ?>
+                <option value="<?php echo $uid2; ?>" <?php if(in_array($uid2,$selectedIds,true)) echo 'selected'; ?>>
                   <?php echo h($u['display_name']); ?>
                 </option>
               <?php endforeach; ?>
-              <?php if(!$hasSelected && !empty($t['assignee_name'])): ?>
-                <option value="" selected data-color="#d9d9d9"><?php echo h($t['assignee_name'].'（未登録）'); ?></option>
-              <?php endif; ?>
             </select>
           </td>
 
@@ -1160,15 +1326,286 @@ btnS.addEventListener('click',()=>{
 });
 
 
-  // 「クリックだけで複数選択」
-  document.querySelectorAll('select[multiple].js-multi-click').forEach(sel=>{
-    Array.from(sel.options).forEach(opt=>{
-      opt.addEventListener('mousedown', function(e){
-        e.preventDefault(); opt.selected = !opt.selected; sel.dispatchEvent(new Event('change'));
-      });
-    });
-    sel.addEventListener('keydown', (e)=>{ if(e.key==='Enter'){ e.preventDefault(); } });
+  const MULTI_PICKERS = [];
+  function closeAllMultiPickers(except){
+    MULTI_PICKERS.forEach(inst=>{ if(inst !== except) inst.close(); });
+  }
+  document.addEventListener('click',e=>{
+    MULTI_PICKERS.forEach(inst=>{ if(!inst.contains(e.target)) inst.close(); });
   });
+
+  class EnhancedMultiSelect {
+    constructor(select, options={}){
+      this.select = select;
+      this.mode = select.dataset.mode || options.mode || 'form';
+      this.placeholder = select.dataset.placeholder || options.placeholder || '検索';
+      this.emptyText = select.dataset.empty_text || select.dataset.emptyText || options.emptyText || '未設定';
+      this.onChange = options.onChange || null;
+      this.disabled = select.disabled;
+      this.isOpen = false;
+      this.silent = false;
+      this.options = Array.from(select.options).map(opt=>({ value: opt.value, label: opt.textContent.trim() }));
+      this.optionMap = new Map(this.options.map(o=>[o.value,o]));
+      this.selected = new Set(
+        Array.from(select.selectedOptions)
+          .map(opt=>opt.value)
+          .filter(v=>v !== '')
+      );
+      this.build();
+      this.lastConfirmed = this.getSelectedValues();
+    }
+
+    build(){
+      this.select.classList.add('multi-select-hidden');
+      this.wrapper = document.createElement('div');
+      this.wrapper.className = 'multi-select-ui';
+      if (this.mode === 'inline') this.wrapper.classList.add('is-inline');
+      if (this.disabled) this.wrapper.classList.add('is-disabled');
+
+      this.valuesWrap = document.createElement('div');
+      this.valuesWrap.className = 'multi-select-values';
+      this.wrapper.appendChild(this.valuesWrap);
+
+      this.inputWrap = document.createElement('span');
+      this.inputWrap.className = 'multi-select-input-wrap';
+      this.input = document.createElement('input');
+      this.input.type = 'text';
+      this.input.className = 'multi-select-input';
+      this.input.placeholder = this.placeholder;
+      this.inputWrap.appendChild(this.input);
+
+      this.dropdown = document.createElement('div');
+      this.dropdown.className = 'multi-select-dropdown';
+      this.wrapper.appendChild(this.dropdown);
+
+      this.select.parentNode.insertBefore(this.wrapper, this.select.nextSibling);
+      this.renderSelected();
+      this.renderDropdown();
+
+      if (!this.disabled) {
+        this.wrapper.addEventListener('click',(e)=>{
+          e.preventDefault();
+          if (!this.isOpen) {
+            closeAllMultiPickers(this);
+            this.open();
+          }
+          this.input.focus();
+        });
+        this.input.addEventListener('keydown',(e)=>{
+          if (e.key === 'Backspace' && !this.input.value && this.selected.size) {
+            e.preventDefault();
+            const arr = Array.from(this.selected.values());
+            const last = arr[arr.length-1];
+            if (last) this.removeValue(last);
+          } else if (e.key === 'Enter') {
+            e.preventDefault();
+            const first = this.dropdown.querySelector('.multi-select-option');
+            if (first && first.dataset.value) {
+              this.toggleValue(first.dataset.value);
+            }
+          } else if (e.key === 'Escape') {
+            this.close();
+          }
+        });
+        this.input.addEventListener('input',()=>{ this.renderDropdown(); });
+      } else {
+        this.input.disabled = true;
+      }
+
+      MULTI_PICKERS.push(this);
+    }
+
+    contains(target){ return this.wrapper.contains(target); }
+
+    open(){
+      if (this.disabled) return;
+      this.isOpen = true;
+      this.wrapper.classList.add('open');
+      this.renderSelected();
+      this.renderDropdown();
+    }
+
+    close(){
+      if (!this.isOpen) return;
+      this.isOpen = false;
+      this.wrapper.classList.remove('open');
+      this.input.value = '';
+      this.renderSelected();
+      this.renderDropdown();
+    }
+
+    renderSelected(){
+      this.valuesWrap.innerHTML = '';
+      const hasSelection = this.selected.size > 0;
+      if (!hasSelection && !this.isOpen) {
+        const placeholder = document.createElement('span');
+        placeholder.className = 'multi-select-placeholder';
+        placeholder.textContent = this.emptyText;
+        this.valuesWrap.appendChild(placeholder);
+      } else {
+        this.selected.forEach(value => {
+          const pill = document.createElement('span');
+          pill.className = 'multi-select-pill';
+          pill.textContent = this.getLabel(value);
+          if (!this.disabled) {
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.innerHTML = '&times;';
+            btn.addEventListener('click',(e)=>{ e.stopPropagation(); this.removeValue(value); });
+            pill.appendChild(btn);
+          }
+          this.valuesWrap.appendChild(pill);
+        });
+      }
+      if (!this.disabled) {
+        this.valuesWrap.appendChild(this.inputWrap);
+      }
+    }
+
+    renderDropdown(){
+      this.dropdown.innerHTML = '';
+      if (!this.isOpen || this.disabled) return;
+      const keyword = this.input.value.trim().toLowerCase();
+      const entries = this.options.filter(opt => opt.value !== '' && opt.label.toLowerCase().includes(keyword));
+      if (!entries.length) {
+        const empty = document.createElement('div');
+        empty.className = 'multi-select-empty';
+        empty.textContent = '該当する担当者がいません';
+        this.dropdown.appendChild(empty);
+        return;
+      }
+      entries.forEach(opt => {
+        const item = document.createElement('div');
+        item.className = 'multi-select-option';
+        if (this.selected.has(opt.value)) item.classList.add('selected');
+        item.dataset.value = opt.value;
+        const label = document.createElement('span');
+        label.textContent = opt.label;
+        const check = document.createElement('span');
+        check.className = 'multi-check';
+        check.textContent = '✓';
+        item.appendChild(label);
+        item.appendChild(check);
+        item.addEventListener('mousedown',(e)=>{
+          e.preventDefault();
+          this.toggleValue(opt.value);
+        });
+        this.dropdown.appendChild(item);
+      });
+    }
+
+    getLabel(value){
+      return (this.optionMap.get(value)?.label) || value;
+    }
+
+    toggleValue(value){
+      if (this.disabled) return;
+      const val = String(value);
+      if (this.selected.has(val)) this.selected.delete(val); else this.selected.add(val);
+      this.syncSelect();
+      this.renderSelected();
+      this.renderDropdown();
+      if (!this.silent && typeof this.onChange === 'function') {
+        this.onChange(this.getSelectedValues(), this);
+      }
+    }
+
+    removeValue(value){
+      if (!this.selected.has(value)) return;
+      this.selected.delete(value);
+      this.syncSelect();
+      this.renderSelected();
+      this.renderDropdown();
+      if (!this.silent && typeof this.onChange === 'function') {
+        this.onChange(this.getSelectedValues(), this);
+      }
+    }
+
+    getSelectedValues(){
+      return Array.from(this.selected.values());
+    }
+
+    setValue(values, opts={}){
+      this.silent = !!opts.silent;
+      this.selected = new Set((values || []).map(v => String(v)).filter(v=>v!==''));
+      this.syncSelect();
+      this.renderSelected();
+      this.renderDropdown();
+      this.silent = false;
+    }
+
+    setOnChange(fn){ this.onChange = fn; }
+
+    syncSelect(){
+      Array.from(this.select.options).forEach(opt=>{
+        if (opt.value === '') {
+          opt.selected = false;
+        } else {
+          opt.selected = this.selected.has(opt.value);
+        }
+      });
+    }
+
+    setLoading(flag){
+      if (!this.wrapper) return;
+      if (flag) this.wrapper.classList.add('is-loading'); else this.wrapper.classList.remove('is-loading');
+    }
+  }
+
+  function initEnhancedPickers(){
+    document.querySelectorAll('select.js-enhanced-multi').forEach(sel=>{
+      if (sel.dataset.enhanced === '1') return;
+      const instance = new EnhancedMultiSelect(sel);
+      sel.dataset.enhanced = '1';
+      if (sel.classList.contains('js-inline-assignees')) {
+        instance.setOnChange((values, picker)=>{
+          const taskId = sel.dataset.taskId;
+          if (!taskId) return;
+          const prev = picker.lastConfirmed ? picker.lastConfirmed.slice() : picker.getSelectedValues();
+          updateTaskAssignees(taskId, values, picker, prev);
+        });
+      }
+    });
+  }
+  initEnhancedPickers();
+
+  function formatAssigneeText(list){
+    if (!list || !list.length) return '未設定';
+    return list.map(item => item && item.name ? item.name : `ID:${item && item.id ? item.id : ''}`).join(', ');
+  }
+
+  function refreshAssigneeDisplay(taskId){
+    if (!taskId) return;
+    if (currentDetailTaskId && String(currentDetailTaskId) === String(taskId)) {
+      detailAss.textContent = formatAssigneeText(TASK_ASSIGNEES[taskId] || []);
+    }
+  }
+
+  async function updateTaskAssignees(taskId, values, picker, previous){
+    if (!taskId) return;
+    const fd = new FormData();
+    fd.append('action','update_assignees');
+    fd.append('ajax','1');
+    fd.append('task_id', taskId);
+    (values || []).filter(v => v !== '').forEach(v => fd.append('assignee_ids[]', v));
+    try {
+      picker?.setLoading(true);
+      const res = await fetch('index.php', { method:'POST', body: fd, credentials:'same-origin' });
+      const j = await res.json();
+      if (!j.ok) throw new Error(j.msg || '担当者の更新に失敗しました');
+      if (picker) picker.lastConfirmed = (values || []).slice();
+      TASK_ASSIGNEES[taskId] = j.assignees || [];
+      refreshAssigneeDisplay(taskId);
+    } catch (err) {
+      console.error(err);
+      alert(err.message || '担当者の更新に失敗しました');
+      if (picker && previous) {
+        picker.setValue(previous, { silent:true });
+      }
+    } finally {
+      picker?.setLoading(false);
+    }
+  }
 
   // ====== ここからビュー＆詳細共通関数 ======
     const CURRENT_TEAM_ID = <?php echo (int)$team_id; ?>;
@@ -1181,6 +1618,7 @@ btnS.addEventListener('click',()=>{
       JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES
     );
   ?>;
+  const TASK_ASSIGNEES = <?php echo json_encode($taskAssigneesForJs, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES); ?>;
 
   async function fetchJson(url, body){
     const res = await fetch(url, {
@@ -1504,7 +1942,8 @@ btnS.addEventListener('click',()=>{
       currentDetailTaskId = t.id;
 
       detailTitle.textContent = t.title || '';
-      detailAss.textContent   = t.assignee_name || '未設定';
+      TASK_ASSIGNEES[t.id] = t.assignees || [];
+      detailAss.textContent   = formatAssigneeText(TASK_ASSIGNEES[t.id]);
       detailStatus.textContent= t.status_name   || '未設定';
       detailPrio.textContent  = t.priority_name || '未設定';
       detailType.textContent  = t.type_name     || '未設定';
